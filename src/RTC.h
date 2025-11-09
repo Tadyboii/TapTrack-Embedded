@@ -9,7 +9,7 @@ extern ThreeWire myWire;
 extern RtcDS1302<ThreeWire> Rtc;
 
 // Function declarations
-void setupRTC();
+void setupAndSyncRTC();
 void printDateTime(const RtcDateTime& dt);
 RtcDateTime getCurrentTime();
 
