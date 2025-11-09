@@ -35,11 +35,12 @@ void loop() {
   if (cardDetected) { // new read interrupt
     Serial.print(F("Card Detected."));
 
-    // UID AND TIME DATA
+    // UID DATA
     String uid = readCardUID();
-    RtcDateTime time = getCurrentTime();
 
     if (uid.length() > 0) {
+      // TIME DATA
+      RtcDateTime time = getCurrentTime();
       Serial.println();
       Serial.print(F("Card UID: "));
       Serial.print(uid);
