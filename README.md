@@ -24,6 +24,7 @@ An ESP32-based RFID attendance tracking system with hybrid online/offline capabi
 - **Real-Time Sync**: Automatic Firebase streaming and attendance syncing.
 - **User-Friendly UI/UX**: WiFi portal, indicators, and serial commands.
 - **Persistent Storage**: SPIFFS-based data persistence.
+- **Custom GPIO Wrapper**: Direct ESP32 GPIO control via custom functions for maximum hardware efficiency and baremetal performance.
 
 ## Architecture Overview
 
@@ -33,7 +34,7 @@ The system is designed as a **baremetal embedded application** running directly 
 #### What Makes It Baremetal?
 - **No Desktop OS**: Unlike systems running Windows, Linux, or macOS, the ESP32 executes code directly on its Xtensa cores without a general-purpose OS. The Arduino framework provides a thin abstraction layer over ESP-IDF (Espressif IoT Development Framework), which includes FreeRTOS—a lightweight real-time OS (RTOS). However, in this project, FreeRTOS is minimally used (e.g., for task scheduling in `loop()`), and most operations are single-threaded, interrupt-driven, and hardware-centric, aligning with baremetal principles.
 - **Direct Hardware Access**: Code interacts directly with ESP32 peripherals via registers and GPIO pins. For example:
-  - GPIO pins are configured manually (e.g., `pinMode()`, `digitalWrite()`) without OS mediation.
+  - GPIO pins are configured manually using a custom wrapper (`gpio.h`/`gpio.cpp`) that interfaces directly with ESP32 GPIO registers, avoiding Arduino abstractions like `pinMode()` and `digitalWrite()`.
   - SPI communication with MFRC522 and DS1302 uses direct SPI registers, not abstracted drivers.
   - Interrupts are attached via `attachInterrupt()`, triggering ISRs that manipulate hardware flags immediately.
 - **Single-Threaded Execution**: The main logic runs in a simple `setup()` → `loop()` cycle, with interrupts for asynchronous events. No multi-threading or OS processes; everything is event-driven and deterministic.
@@ -182,6 +183,12 @@ The FSM manages system modes, ensuring predictable behavior and easy transitions
 - **Contents**: GPIO mappings, intervals, FSM enums.
 - **Usage**: Centralized configuration for easy changes.
 
+#### gpio.h & gpio.cpp
+- **Role**: Custom GPIO wrapper for direct ESP32 GPIO control.
+- **Key Features**: Provides functions like `gpio_pin_init()`, `gpio_write()`, `gpio_read()` that interface directly with ESP32 GPIO registers, supporting input/output modes and pull-up/down resistors.
+- **Integration**: Used throughout the project for all GPIO operations (LEDs, buzzer, buttons, RTC), replacing Arduino GPIO functions for better performance and control.
+- **Benefits**: Eliminates Arduino abstraction overhead, ensures consistent baremetal-style hardware access.
+
 #### secrets.h
 - **Role**: Stores sensitive credentials.
 - **Contents**: WiFi SSID/password, Firebase host/auth.
@@ -231,6 +238,7 @@ The FSM manages system modes, ensuring predictable behavior and easy transitions
 - **Firebase.cpp**: Manages database sync and streaming.
 - **UserDatabase.h**: Class for local user storage (SPIFFS JSON).
 - **AttendanceQueue.h**: Class for offline queue (SPIFFS JSON).
+- **gpio.h & gpio.cpp**: Custom GPIO wrapper for direct ESP32 hardware control.
 
 ### Key Functions
 - **setup()**: Initializes SPIFFS, RFID, WiFi menu, Firebase if online.
