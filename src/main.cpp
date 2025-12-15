@@ -3,12 +3,12 @@
 #include <MFRC522.h>
 #include <SPIFFS.h>
 #include "RFID.h"
-#include <RtcDS1302.h>
-#include "RTC.h"
 #include "Firebase.h"
 #include "UserDatabase.h"
 #include "AttendanceQueue.h"
 #include "WifiManager.h"
+#include "DS1302_RTC.h"
+#include "indicator.h"
 
 // Attendance time thresholds (24-hour format)
 #define ON_TIME_HOUR 9    // Before 9:00 AM is on time
@@ -44,8 +44,8 @@ bool syncInProgress = false;
 /**
  * Determine attendance status based on time
  */
-String getAttendanceStatus(const RtcDateTime& time) {
-    int hour = time.Hour();
+String getAttendanceStatus(const DateTime& time) {
+    int hour = time.hour;
     
     if (hour < ON_TIME_HOUR) {
         return "present";  // On time
@@ -235,6 +235,11 @@ void setup() {
   setupAndSyncRTC();
   Serial.println(F("✓ RTC ready"));
 
+  // Initialize Indicators
+    Serial.println(F("💡 Initializing Indicators..."));
+    initIndicator();
+    Serial.println(F("✓ Indicators ready"));
+
   // Initialize Firebase if online
   if (isOnline) {
     Serial.println(F("🔥 Initializing Firebase..."));
@@ -329,7 +334,7 @@ void loop() {
     
     if (uid.length() > 0) {
       // Get timestamp
-      RtcDateTime time = getCurrentTime();
+      DateTime time = getCurrentTime();
       Serial.println();
       Serial.print(F("Card UID: "));
       Serial.print(uid);
@@ -346,11 +351,11 @@ void loop() {
         return;  // Skip processing
       }
       
-      // Format timestamp in ISO 8601 format
+    //   Format timestamp in ISO 8601 format
       char timestamp[30];
       snprintf(timestamp, sizeof(timestamp), "%04u-%02u-%02uT%02u:%02u:%02u.000Z",
-               time.Year(), time.Month(), time.Day(),
-               time.Hour(), time.Minute(), time.Second());
+               time.year, time.month, time.day,
+               time.hour, time.minute, time.second);
 
       // Look up user information
       UserInfo userInfo = userDB.getUserInfo(uid);
@@ -374,11 +379,13 @@ void loop() {
         if (userInfo.isRegistered) {
           // Registered user - send attendance directly
           sendToFirebase(uid, name, String(timestamp), attendanceStatus, registrationStatus);
+          indicateSuccessOnline();
         } else {
           // Unknown/unregistered user - send to pendingUsers only (no attendance)
           Serial.println(F("➤ Sending to pending users (no attendance for unregistered)"));
           fetchUserFromFirebase(uid);  // Try fetching in background
           sendPendingUser(uid, String(timestamp));
+          indicateSuccessOnline();
           // DO NOT send to attendance - wait for approval and re-scan
         }
       } else {
@@ -386,17 +393,20 @@ void loop() {
         if (userInfo.isRegistered) {
           Serial.println(F("📴 Offline - Queuing attendance locally"));
           attendanceQueue.enqueue(uid, name, String(timestamp), attendanceStatus, registrationStatus);
+          indicateSuccessOffline();
         } else {
           Serial.println(F("⚠️ Offline + Unregistered - Cannot process"));
           Serial.println(F("   (User must be registered when online first)"));
+          indicateSuccessOffline();
         }
       }
 
     } else {
+      indicateError();
       Serial.print(F(" Reading UID... Place card again."));
       Serial.println();
     }
-
+    clearIndicators();
     clearInt();
     cardDetected = false;
   }
