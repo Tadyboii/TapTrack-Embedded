@@ -1,51 +1,93 @@
+/*
+ * TapTrack - RFID Module Implementation
+ * MFRC522 RFID Reader with interrupt-driven card detection
+ */
+
 #include "RFID.h"
 
+// =============================================================================
+// GLOBAL VARIABLES
+// =============================================================================
+
 volatile bool cardDetected = false;
-byte regVal = 0x7F;
-unsigned long lastReset = 0; 
+static byte regVal = 0x7F;
+static unsigned long lastReset = 0;
 
 // MFRC522 instance
 MFRC522 mfrc522(RFID_SS_PIN, RFID_RST_PIN);
 
-void initRFID(){
+// =============================================================================
+// INITIALIZATION
+// =============================================================================
+
+void initRFID() {
     mfrc522.PCD_Init();
+    
+    // Verify module is responding
+    byte version = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+    if (version == 0x00 || version == 0xFF) {
+        Serial.println(F("⚠️ WARNING: MFRC522 not detected!"));
+    } else {
+        Serial.print(F("✓ MFRC522 firmware version: 0x"));
+        Serial.println(version, HEX);
+    }
+    
+    lastReset = millis();
 }
 
-/**
- * MFRC522 interrupt serving routine
- */
+// =============================================================================
+// INTERRUPT HANDLING
+// =============================================================================
+
 void IRAM_ATTR readCardISR() {
     cardDetected = true;
 }
 
-/*
- * The function sending to the MFRC522 the needed commands to activate the reception
- */
 void activateRec() {
     mfrc522.PCD_WriteRegister(mfrc522.FIFODataReg, mfrc522.PICC_CMD_REQA);
     mfrc522.PCD_WriteRegister(mfrc522.CommandReg, mfrc522.PCD_Transceive);
     mfrc522.PCD_WriteRegister(mfrc522.BitFramingReg, 0x87);
 }
 
-/*
- * The function to clear the pending interrupt bits after interrupt serving routine
- */
 void clearInt() {
     mfrc522.PCD_WriteRegister(mfrc522.ComIrqReg, 0x7F);
 }
 
-/*
- * Allow the ... irq to be propagated to the IRQ pin
- * For test purposes propagate the IdleIrq and loAlert
- */
 void enableInterrupt() {
-    regVal = 0xA0; //rx irq
+    regVal = 0xA0;  // RX IRQ
     mfrc522.PCD_WriteRegister(mfrc522.ComIEnReg, regVal);
 }
 
-/**
- * Helper routine to dump a byte array as hex values to Serial.
- */
+// =============================================================================
+// CARD READING
+// =============================================================================
+
+String readCardUID() {
+    // Attempt to read the card serial
+    if (!mfrc522.PICC_ReadCardSerial()) {
+        return "";
+    }
+    
+    String uidStr = "";
+    
+    // Build UID string from bytes
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+        if (mfrc522.uid.uidByte[i] < 0x10) {
+            uidStr += "0";
+        }
+        uidStr += String(mfrc522.uid.uidByte[i], HEX);
+    }
+    uidStr.toUpperCase();
+    
+    // Halt the card
+    mfrc522.PICC_HaltA();
+    
+    // Clear buffer for next read
+    clearUIDBuffer();
+    
+    return uidStr;
+}
+
 void dump_byte_array(byte *buffer, byte bufferSize) {
     for (byte i = 0; i < bufferSize; i++) {
         Serial.print(buffer[i] < 0x10 ? " 0" : " ");
@@ -54,51 +96,47 @@ void dump_byte_array(byte *buffer, byte bufferSize) {
 }
 
 /**
- * Function to read RFID card data and return UID as String
- */
-String readCardUID() {
-    mfrc522.PICC_ReadCardSerial(); // read the tag data
-    String uidStr = "";
-
-    //   Show some details of the PICC (that is: the tag/card)
-    //   Serial.print(F("Card UID:"));
-    //   dump_byte_array(mfrc522.uid.uidByte, mfrc522.uid.size);
-    //   Serial.println();
-
-    // Build UID string
-    for (byte i = 0; i < mfrc522.uid.size; i++) {
-        if (mfrc522.uid.uidByte[i] < 0x10) uidStr += "0";
-        uidStr += String(mfrc522.uid.uidByte[i], HEX);
-    }
-    uidStr.toUpperCase();
-
-    mfrc522.PICC_HaltA();
-
-    clearUIDBuffer();
-
-    return uidStr;
-}
-
-/**
- * Function to clear the UID buffer
+ * Clear the UID buffer - FIXED VERSION
+ * Bug fix: Must clear bytes BEFORE setting size to 0
  */
 void clearUIDBuffer() {
-    // Method 1: Direct clearing
-    mfrc522.uid.size = 0;
-    for (byte i = 0; i < mfrc522.uid.size; i++) {
+    // Clear all possible UID bytes first (max 10 bytes for double-size UID)
+    for (byte i = 0; i < 10; i++) {
         mfrc522.uid.uidByte[i] = 0;
     }
-
-    // Method 2: Reset the FIFO buffer (optional)
-    //   mfrc522.PCD_WriteRegister(mfrc522.FIFOLevelReg, 0x80); // Set FlushBuffer bit
+    
+    // Now set size to 0
+    mfrc522.uid.size = 0;
+    mfrc522.uid.sak = 0;
+    
+    // Optional: Flush the FIFO buffer
+    mfrc522.PCD_WriteRegister(mfrc522.FIFOLevelReg, 0x80);
 }
 
+// =============================================================================
+// HEALTH CHECK & RESET
+// =============================================================================
+
 void checkAndResetMFRC522() {
-// Reset module every 5 seconds
-    if (millis() - lastReset > 5000) {
-        // Serial.println(F("Resetting MFRC522..."));
-        mfrc522.PCD_Init(); // Simple re-initialization
-        enableInterrupt(); // Re-enable interrupts
+    // Reset module periodically to prevent lockups
+    if (millis() - lastReset > RFID_RESET_INTERVAL_MS) {
+        mfrc522.PCD_Init();
+        enableInterrupt();
         lastReset = millis();
+        
+        #if DEBUG_RFID
+        Serial.println(F("🔄 MFRC522 reset"));
+        #endif
     }
+}
+
+bool isRFIDHealthy() {
+    byte version = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+    
+    // Known valid versions: 0x91 (v1.0), 0x92 (v2.0), 0x88 (clone)
+    if (version == 0x00 || version == 0xFF) {
+        return false;
+    }
+    
+    return true;
 }

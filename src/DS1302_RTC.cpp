@@ -4,6 +4,7 @@
  */
 
 #include "DS1302_RTC.h"
+#include "gpio.h"
 
 // =============================================================================
 // NTP CONFIGURATION
@@ -32,9 +33,9 @@ DS1302_RTC::DS1302_RTC(uint8_t ioPin, uint8_t sclkPin, uint8_t cePin)
  */
 void DS1302_RTC::begin() {
     // Set pins to default state (low, input)
-    pinMode(_cePin, INPUT);
-    pinMode(_sclkPin, INPUT);
-    pinMode(_ioPin, INPUT);
+    gpio_pin_init(_cePin, GPIO_INPUT_MODE);
+    gpio_pin_init(_sclkPin, GPIO_INPUT_MODE);
+    gpio_pin_init(_ioPin, GPIO_INPUT_MODE);
     
     // Disable write protection to allow configuration
     setWriteProtect(false);
@@ -149,18 +150,18 @@ void DS1302_RTC::setRunning(bool running) {
  */
 void DS1302_RTC::beginTransmission(uint8_t address) {
     // Set CE low first
-    digitalWrite(_cePin, LOW);
-    pinMode(_cePin, OUTPUT);
+    gpio_write(_cePin, 0);
+    gpio_pin_init(_cePin, GPIO_OUTPUT_MODE);
     
     // Set SCLK low
-    digitalWrite(_sclkPin, LOW);
-    pinMode(_sclkPin, OUTPUT);
+    gpio_write(_sclkPin, 0);
+    gpio_pin_init(_sclkPin, GPIO_OUTPUT_MODE);
     
     // Set IO as output
-    pinMode(_ioPin, OUTPUT);
+    gpio_pin_init(_ioPin, GPIO_OUTPUT_MODE);
     
     // Enable the chip (CE high)
-    digitalWrite(_cePin, HIGH);
+    gpio_write(_cePin, 1);
     delayMicroseconds(4);  // tCC = 4us
     
     // Send the address/command byte
@@ -172,13 +173,13 @@ void DS1302_RTC::beginTransmission(uint8_t address) {
  */
 void DS1302_RTC::endTransmission() {
     // Disable the chip (CE low)
-    digitalWrite(_cePin, LOW);
+    gpio_write(_cePin, 0);
     delayMicroseconds(4);  // tCWH = 4us
     
     // Reset pins to input (low power state)
-    pinMode(_cePin, INPUT);
-    pinMode(_sclkPin, INPUT);
-    pinMode(_ioPin, INPUT);
+    gpio_pin_init(_cePin, GPIO_INPUT_MODE);
+    gpio_pin_init(_sclkPin, GPIO_INPUT_MODE);
+    gpio_pin_init(_ioPin, GPIO_INPUT_MODE);
 }
 
 /**
@@ -187,20 +188,20 @@ void DS1302_RTC::endTransmission() {
 void DS1302_RTC::writeByte(uint8_t data, bool isRead) {
     for (uint8_t i = 0; i < 8; i++) {
         // Set data bit
-        digitalWrite(_ioPin, data & 0x01);
+        gpio_write(_ioPin, data & 0x01);
         delayMicroseconds(1);  // tDC = 200ns
         
         // Clock high (DS1302 reads on rising edge)
-        digitalWrite(_sclkPin, HIGH);
+        gpio_write(_sclkPin, 1);
         delayMicroseconds(1);  // tCH = 1000ns
         
         // If this is the last bit before a read, switch IO to input
         if (i == 7 && isRead) {
-            pinMode(_ioPin, INPUT);
+            gpio_pin_init(_ioPin, GPIO_INPUT_MODE);
         }
         
         // Clock low
-        digitalWrite(_sclkPin, LOW);
+        gpio_write(_sclkPin, 0);
         delayMicroseconds(1);  // tCL = 1000ns
         
         // Shift to next bit
@@ -216,14 +217,14 @@ uint8_t DS1302_RTC::readByte() {
     
     for (uint8_t i = 0; i < 8; i++) {
         // Read bit (LSB first)
-        data |= (digitalRead(_ioPin) << i);
+        data |= (gpio_read(_ioPin) << i);
         
         // Clock high
-        digitalWrite(_sclkPin, HIGH);
+        gpio_write(_sclkPin, 1);
         delayMicroseconds(1);
         
         // Clock low (data is ready after this)
-        digitalWrite(_sclkPin, LOW);
+        gpio_write(_sclkPin, 0);
         delayMicroseconds(1);  // tCL = 1000ns, tCDD = 800ns
     }
     

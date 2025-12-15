@@ -1,418 +1,514 @@
+/*
+ * TapTrack - Firebase Module Implementation
+ * Real-time sync with confirmation tracking
+ */
+
 #include "Firebase.h"
 #include "UserDatabase.h"
 #include <ArduinoJson.h>
+#include <map>
 
-// Reference to main's firebaseInitialized flag so we can mark ready after sync
+// =============================================================================
+// EXTERNAL REFERENCES
+// =============================================================================
+
+extern UserDatabase userDB;
 extern bool firebaseInitialized;
 
-// Authentication
-UserAuth user_auth(Web_API_KEY, USER_EMAIL, USER_PASS);
+// =============================================================================
+// FIREBASE OBJECTS
+// =============================================================================
 
-// Firebase components
+UserAuth user_auth(FIREBASE_API_KEY, FIREBASE_USER_EMAIL, FIREBASE_USER_PASSWORD);
 FirebaseApp app;
 WiFiClientSecure ssl_client;
-using AsyncClient = AsyncClientClass;
-AsyncClient aClient(ssl_client);
+DefaultNetwork network;
+AsyncClientClass aClient(ssl_client, getNetwork(network));
 RealtimeDatabase Database;
 
 // JSON tools
-object_t jsonData, obj1, obj2, obj3, obj4, obj5;
-JsonWriter writer;
+static object_t jsonData, obj1, obj2, obj3, obj4, obj5;
+static JsonWriter writer;
 
-/**
- * Initialize Firebase connection
- */
+// =============================================================================
+// SYNC TRACKING
+// =============================================================================
+
+SyncState syncState = {
+    .status = SYNC_IDLE,
+    .lastError = "",
+    .lastSyncTime = 0,
+    .pendingCount = 0,
+    .successCount = 0,
+    .failCount = 0
+};
+
+// Track pending operations by their task ID
+static std::map<String, bool> pendingOperations;
+static std::map<String, bool> confirmedOperations;
+
+// User change callback
+static UserChangeCallback userChangeCallback = nullptr;
+
+// Stream state
+static bool userStreamActive = false;
+static unsigned long lastStreamActivity = 0;
+
+// =============================================================================
+// INITIALIZATION
+// =============================================================================
+
 void initFirebase() {
-    Serial.println(F("Initializing Firebase..."));
+    Serial.println(F("🔥 Initializing Firebase..."));
     
-    // Configure SSL client
     ssl_client.setInsecure();
     ssl_client.setTimeout(1000);
     ssl_client.setHandshakeTimeout(5);
-
-    // Initialize Firebase   
+    
     initializeApp(aClient, app, getAuth(user_auth), processData, "authTask");
     app.getApp<RealtimeDatabase>(Database);
-    Database.url(DATABASE_URL);
+    Database.url(FIREBASE_DATABASE_URL);
     
-    Serial.println(F("Firebase initialized"));
+    syncState.status = SYNC_IDLE;
+    Serial.println(F("✓ Firebase initialized"));
 }
 
-/**
- * Process Firebase async results
- */
+bool isFirebaseReady() {
+    return app.ready();
+}
+
+bool isFirebaseAuthenticated() {
+    return app.ready() && app.isAuthenticated();
+}
+
+// =============================================================================
+// ASYNC RESULT HANDLER
+// =============================================================================
+
 void processData(AsyncResult &aResult) {
-    if (!aResult.isResult())
+    String tag = String(aResult.uid().c_str());
+    
+    // Handle events
+    if (aResult.isEvent()) {
+        #if DEBUG_FIREBASE
+        Serial.printf("Event [%s]: %s (code: %d)\n", 
+                      tag.c_str(),
+                      aResult.eventLog().message().c_str(),
+                      aResult.eventLog().code());
+        #endif
+    }
+    
+    // Handle errors
+    if (aResult.isError()) {
+        Serial.printf("❌ Firebase error [%s]: %s (code: %d)\n",
+                      tag.c_str(),
+                      aResult.error().message().c_str(),
+                      aResult.error().code());
+        
+        syncState.lastError = aResult.error().message().c_str();
+        syncState.failCount++;
+        
+        // Mark operation as failed
+        if (pendingOperations.count(tag)) {
+            pendingOperations.erase(tag);
+        }
+        
+        // Handle attendance push failures
+        if (tag.startsWith("Push_Attendance_")) {
+            syncState.status = SYNC_FAILED;
+        }
+        
         return;
-
-    if (aResult.isEvent())
-    {
-        Firebase.printf("Event task: %s, msg: %s, code: %d\n", 
-                        aResult.uid().c_str(), 
-                        aResult.eventLog().message().c_str(), 
-                        aResult.eventLog().code());
     }
-
-    // Handle stream payloads separately - they appear in available() not just isEvent()
-    if (aResult.available())
-    {
-        String tag = String(aResult.uid().c_str());
-        
-        // Check if this is a stream payload (task name contains "task_" for streams)
-        if (tag.startsWith("task_")) {
-            const char* raw = aResult.c_str();
-            Serial.print(F("DEBUG: Stream raw payload: "));
-            Serial.println(raw);
-            // The payload from the stream often comes as text like:
-            // "event: put\ndata: {\"path\":\"/2048C51A\",\"data\":{...}}"
-            // Find the first JSON object in the payload (look for '{')
-            const char* jsonStart = strchr(raw, '{');
-            if (jsonStart) {
-                Serial.println(F("DEBUG: Found JSON start, parsing..."));
-                DynamicJsonDocument doc(8192);
-                DeserializationError err = deserializeJson(doc, jsonStart);
-                if (err) {
-                    Serial.print(F("JSON parse error (stream event): "));
-                    Serial.println(err.c_str());
-                } else {
-                    JsonObject root = doc.as<JsonObject>();
-                    Serial.println(F("DEBUG: JSON parsed successfully"));
-                    // Expecting keys "path" and "data"
-                    if (root.containsKey("path") && root.containsKey("data")) {
-                        const char* path = root["path"].as<const char*>();
-                        JsonVariant data = root["data"];
-                        Serial.print(F("DEBUG: Path="));
-                        Serial.print(path);
-                        Serial.print(F(", data.isNull="));
-                        Serial.println(data.isNull() ? "true" : "false");
-
-                        // Only handle changes under /users (path may be "/" for full payload)
-                        // When streaming /users, the path refers to the child path under /users
-                        // e.g. path: "/2048C51A" or path: "/" for full replace
-                        if (path) {
-                            String spath = String(path);
-                            if (spath == "/") {
-                                // Full payload: data is an object mapping uid -> user object
-                                if (data.is<JsonObject>()) {
-                                    for (JsonPair kv : data.as<JsonObject>()) {
-                                        // The child key may be a Firebase push-key; prefer the inner "uid" field when present
-                                        String childKey = String(kv.key().c_str());
-                                        String uid = childKey;
-                                        String name = "";
-                                        JsonObject childObj = kv.value().as<JsonObject>();
-                                        if (!childObj.isNull()) {
-                                            if (childObj.containsKey("uid")) {
-                                                uid = String(childObj["uid"].as<const char*>());
-                                            }
-                                            if (childObj.containsKey("name")) {
-                                                name = String(childObj["name"].as<const char*>());
-                                            }
-                                        }
-                                        uid.toUpperCase();
-                                        if (name.length() > 0) {
-                                            userDB.registerUser(uid, name);
-                                            Serial.print(F("Stream: registered user: "));
-                                            Serial.print(name);
-                                            Serial.print(F(" ("));
-                                            Serial.print(uid);
-                                            Serial.println(F(")"));
-                                        }
-                                    }
-                                    userDB.saveToSPIFFS();  // Persist stream updates
-                                }
-                            } else {
-                                // Single-child change: path like "/2048C51A"
-                                String uid = spath.substring(1);
-                                uid.toUpperCase();
-                                if (data.isNull()) {
-                                    // deletion
-                                    Serial.print(F("Stream: user removed: "));
-                                    Serial.println(uid);
-                                    userDB.unregisterUser(uid);
-                                    userDB.saveToSPIFFS();  // Persist deletion
-                                } else {
-                                    JsonObject uobj = data.as<JsonObject>();
-                                    if (!uobj.isNull()) {
-                                        String name = "";
-                                        // Prefer inner uid if present
-                                        if (uobj.containsKey("uid")) {
-                                            uid = String(uobj["uid"].as<const char*>());
-                                            uid.toUpperCase();
-                                        }
-                                        if (uobj.containsKey("name")) name = String(uobj["name"].as<const char*>());
-                                        if (name.length() > 0) {
-                                            userDB.registerUser(uid, name);
-                                            userDB.saveToSPIFFS();  // Persist new user from stream
-                                            Serial.print(F("Stream: registered user: "));
-                                            Serial.print(name);
-                                            Serial.print(F(" ("));
-                                            Serial.print(uid);
-                                            Serial.println(F(")"));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (aResult.isDebug())
-        Firebase.printf("Debug task: %s, msg: %s\n", 
-                        aResult.uid().c_str(), 
-                        aResult.debug().c_str());
-
-    if (aResult.isError())
-        Firebase.printf("Error task: %s, msg: %s, code: %d\n", 
-                        aResult.uid().c_str(), 
-                        aResult.error().message().c_str(), 
-                        aResult.error().code());
-
-    if (aResult.available())
-        Firebase.printf("task: %s, payload: %s\n", 
-                        aResult.uid().c_str(), 
-                        aResult.c_str());
-
-    // Process available payloads
+    
+    // Handle successful responses
     if (aResult.available()) {
-        // If this was the async response for fetching all users, parse and populate userDB
-        String tag = String(aResult.uid().c_str());
+        const char* payload = aResult.c_str();
         
-        // Handle stream events (tag starts with "task_")
-        if (tag.startsWith("task_")) {
-            const char* raw = aResult.c_str();
-            Serial.print(F("DEBUG: Processing stream payload for tag: "));
+        #if DEBUG_FIREBASE
+        Serial.printf("Response [%s]: %s\n", tag.c_str(), payload);
+        #endif
+        
+        // =========================================
+        // Handle attendance push confirmation
+        // =========================================
+        if (tag.startsWith("Push_Attendance_")) {
+            confirmedOperations[tag] = true;
+            pendingOperations.erase(tag);
+            syncState.successCount++;
+            syncState.lastSyncTime = millis();
+            syncState.status = SYNC_SUCCESS;
+            
+            Serial.print(F("✅ Attendance confirmed: "));
             Serial.println(tag);
-            // Find the JSON in the stream payload
-            const char* jsonStart = strchr(raw, '{');
-            if (jsonStart) {
-                DynamicJsonDocument doc(8192);
-                DeserializationError err = deserializeJson(doc, jsonStart);
-                if (!err) {
-                    JsonObject root = doc.as<JsonObject>();
-                    if (root.containsKey("path") && root.containsKey("data")) {
-                        const char* path = root["path"].as<const char*>();
-                        JsonVariant data = root["data"];
-                        
-                        if (path && String(path) == "/" && data.is<JsonObject>()) {
-                            // Full /users payload
-                            for (JsonPair kv : data.as<JsonObject>()) {
-                                JsonObject childObj = kv.value().as<JsonObject>();
-                                if (!childObj.isNull() && childObj.containsKey("uid") && childObj.containsKey("name")) {
-                                    String uid = String(childObj["uid"].as<const char*>());
-                                    String name = String(childObj["name"].as<const char*>());
-                                    uid.toUpperCase();
-                                    userDB.registerUser(uid, name);
-                                    Serial.print(F("✓ Stream registered: "));
-                                    Serial.print(name);
-                                    Serial.print(F(" ("));
-                                    Serial.print(uid);
-                                    Serial.println(F(")"));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            return;
         }
         
-            if (tag == "Get_Users") {
-            // Parse JSON payload and populate userDB
-            DynamicJsonDocument doc(8192);
-            DeserializationError err = deserializeJson(doc, aResult.c_str());
-            if (err) {
-                Serial.print(F("JSON parse error (Get_Users): "));
-                Serial.println(err.c_str());
-            } else {
-                JsonObject usersObj = doc.as<JsonObject>();
-                for (JsonPair kv : usersObj) {
-                    String uid = String(kv.key().c_str());
-                    String name = "";
-                    if (kv.value().is<JsonObject>() && kv.value().as<JsonObject>().containsKey("name")) {
-                        name = String(kv.value()["name"].as<const char*>());
-                    }
-                    uid.toUpperCase();
-                    userDB.registerUser(uid, name);
-                }
-                Serial.println(F("Synced users from Firebase (async)"));
-                // Save to SPIFFS for offline use
-                userDB.saveToSPIFFS();
-                // Show the users we just registered and mark Firebase as initialized
-                userDB.printAllUsers();
-                firebaseInitialized = true;
-            }
-        }        // Handle per-user async responses: tags like "Get_User_<UID>"
-        else if (tag.startsWith("Get_User_")) {
-            // Extract UID from tag
-            String uid = tag.substring(strlen("Get_User_"));
-            uid.toUpperCase();
-
-            // aResult.c_str() may be "null" if user not found
-            const char* payload = aResult.c_str();
+        // =========================================
+        // Handle Get_Users response
+        // =========================================
+        if (tag == "Get_Users") {
             if (!payload || strcmp(payload, "null") == 0) {
-                Serial.print(F("User not found on server: "));
-                Serial.println(uid);
+                Serial.println(F("ℹ️ No users in Firebase"));
+                firebaseInitialized = true;
                 return;
             }
-
-            DynamicJsonDocument doc(1024);
+            
+            DynamicJsonDocument doc(JSON_BUFFER_LARGE);
             DeserializationError err = deserializeJson(doc, payload);
+            
             if (err) {
-                Serial.print(F("JSON parse error (Get_User): "));
-                Serial.println(err.c_str());
+                Serial.printf("❌ JSON parse error (Get_Users): %s\n", err.c_str());
                 return;
             }
-
-            JsonObject obj = doc.as<JsonObject>();
-            String name = "";
-            if (obj.containsKey("name")) {
-                name = String(obj["name"].as<const char*>());
-            }
-
+            
+            JsonObject usersObj = doc.as<JsonObject>();
+            int count = 0;
+            
+            for (JsonPair kv : usersObj) {
+                String uid = String(kv.key().c_str());
+                uid.toUpperCase();
+                String name = "";
+                
+                if (kv.value().is<JsonObject>()) {
+                    JsonObject userObj = kv.value().as<JsonObject>();
+                    if (userObj.containsKey("name")) {
+                        name = userObj["name"].as<String>();
+                    }
+                    // Prefer inner uid if present
+                    if (userObj.containsKey("uid")) {
+                        uid = userObj["uid"].as<String>();
+                        uid.toUpperCase();
+                    }
+                }
+                
                 if (name.length() > 0) {
                     userDB.registerUser(uid, name);
-                    userDB.saveToSPIFFS();  // Persist new user
-                    Serial.print(F("Registered user from Firebase: "));
-                    Serial.print(name);
-                    Serial.print(F(" ("));
-                    Serial.print(uid);
-                    Serial.println(F(")"));
-                } else {
-                    Serial.print(F("User object fetched but no name field: "));
-                    Serial.println(uid);
+                    count++;
                 }
+            }
+            
+            Serial.printf("✅ Synced %d users from Firebase\n", count);
+            userDB.saveToSPIFFS();
+            userDB.printAllUsers();
+            firebaseInitialized = true;
+            return;
+        }
+        
+        // =========================================
+        // Handle Get_User_<UID> response
+        // =========================================
+        if (tag.startsWith("Get_User_")) {
+            String uid = tag.substring(9);
+            uid.toUpperCase();
+            
+            if (!payload || strcmp(payload, "null") == 0) {
+                Serial.printf("ℹ️ User not found: %s\n", uid.c_str());
+                return;
+            }
+            
+            DynamicJsonDocument doc(JSON_BUFFER_SMALL);
+            DeserializationError err = deserializeJson(doc, payload);
+            
+            if (err) {
+                Serial.printf("❌ JSON parse error (Get_User): %s\n", err.c_str());
+                return;
+            }
+            
+            JsonObject obj = doc.as<JsonObject>();
+            String name = obj.containsKey("name") ? obj["name"].as<String>() : "";
+            
+            if (name.length() > 0) {
+                userDB.registerUser(uid, name);
+                userDB.saveToSPIFFS();
+                Serial.printf("✅ Registered user from Firebase: %s (%s)\n", 
+                             name.c_str(), uid.c_str());
+                
+                if (userChangeCallback) {
+                    userChangeCallback(uid, name, true);
+                }
+            }
+            return;
+        }
+        
+        // =========================================
+        // Handle stream payloads (UserStream)
+        // =========================================
+        if (tag.startsWith("UserStream") || tag.startsWith("task_")) {
+            lastStreamActivity = millis();
+            userStreamActive = true;
+            
+            // Find JSON in stream payload
+            const char* jsonStart = strchr(payload, '{');
+            if (!jsonStart) return;
+            
+            DynamicJsonDocument doc(JSON_BUFFER_LARGE);
+            DeserializationError err = deserializeJson(doc, jsonStart);
+            
+            if (err) {
+                #if DEBUG_FIREBASE
+                Serial.printf("JSON parse error (stream): %s\n", err.c_str());
+                #endif
+                return;
+            }
+            
+            JsonObject root = doc.as<JsonObject>();
+            
+            if (root.containsKey("path") && root.containsKey("data")) {
+                String path = root["path"].as<String>();
+                JsonVariant data = root["data"];
+                
+                if (path == "/") {
+                    // Full payload - iterate all users
+                    if (data.is<JsonObject>()) {
+                        for (JsonPair kv : data.as<JsonObject>()) {
+                            String uid = String(kv.key().c_str());
+                            uid.toUpperCase();
+                            String name = "";
+                            
+                            JsonObject userObj = kv.value().as<JsonObject>();
+                            if (!userObj.isNull()) {
+                                if (userObj.containsKey("uid")) {
+                                    uid = userObj["uid"].as<String>();
+                                    uid.toUpperCase();
+                                }
+                                if (userObj.containsKey("name")) {
+                                    name = userObj["name"].as<String>();
+                                }
+                            }
+                            
+                            if (name.length() > 0) {
+                                userDB.registerUser(uid, name);
+                                Serial.printf("📥 Stream: user %s (%s)\n", 
+                                             name.c_str(), uid.c_str());
+                                
+                                if (userChangeCallback) {
+                                    userChangeCallback(uid, name, true);
+                                }
+                            }
+                        }
+                        userDB.saveToSPIFFS();
+                    }
+                } else {
+                    // Single user change - path like "/2048C51A"
+                    String uid = path.substring(1);
+                    uid.toUpperCase();
+                    
+                    if (data.isNull()) {
+                        // User deleted
+                        Serial.printf("📤 Stream: user removed %s\n", uid.c_str());
+                        userDB.unregisterUser(uid);
+                        userDB.saveToSPIFFS();
+                        
+                        if (userChangeCallback) {
+                            userChangeCallback(uid, "", false);
+                        }
+                    } else {
+                        // User added/modified
+                        JsonObject userObj = data.as<JsonObject>();
+                        String name = "";
+                        
+                        if (!userObj.isNull()) {
+                            if (userObj.containsKey("uid")) {
+                                uid = userObj["uid"].as<String>();
+                                uid.toUpperCase();
+                            }
+                            if (userObj.containsKey("name")) {
+                                name = userObj["name"].as<String>();
+                            }
+                        }
+                        
+                        if (name.length() > 0) {
+                            userDB.registerUser(uid, name);
+                            userDB.saveToSPIFFS();
+                            Serial.printf("📥 Stream: registered %s (%s)\n", 
+                                         name.c_str(), uid.c_str());
+                            
+                            if (userChangeCallback) {
+                                userChangeCallback(uid, name, true);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        
+        // =========================================
+        // Handle other confirmations
+        // =========================================
+        if (tag.startsWith("Set_Pending") || tag.startsWith("Set_User")) {
+            Serial.printf("✅ Operation confirmed: %s\n", tag.c_str());
+            return;
         }
     }
-}/**
- * Send attendance data to Firebase
- * Matches Flutter Attendance model structure
- * @param uid - RFID card UID
- * @param name - Person's name (empty for unregistered)
- * @param timestamp - Formatted timestamp string (ISO 8601 format)
- * @param attendanceStatus - "present", "late", "absent", etc.
- * @param registrationStatus - "registered" or "unregistered"
- */
-void sendToFirebase(String uid, String name, String timestamp, String attendanceStatus, String registrationStatus) {
-    // Wait for Firebase to be ready
-    while (!app.ready()) {
-        Serial.println(F("Firebase not ready, waiting..."));
-        app.loop();
-        delay(100);
-    }
+}
 
-    // Build JSON matching Flutter model
-    object_t obj3, obj4, obj5;
+// =============================================================================
+// ATTENDANCE FUNCTIONS
+// =============================================================================
+
+String sendToFirebase(String uid, String name, String timestamp,
+                      String attendanceStatus, String registrationStatus) {
     
+    if (!app.ready()) {
+        Serial.println(F("⚠️ Firebase not ready"));
+        return "";
+    }
+    
+    // Generate unique sync ID
+    String syncId = "Push_Attendance_" + String(millis());
+    
+    // Build JSON
     writer.create(obj1, "uid", uid);
     writer.create(obj2, "name", name);
     writer.create(obj3, "timestamp", timestamp);
     writer.create(obj4, "attendanceStatus", attendanceStatus);
     writer.create(obj5, "registrationStatus", registrationStatus);
-    
     writer.join(jsonData, 5, obj1, obj2, obj3, obj4, obj5);
-
-    // Push JSON to Firebase
-    Database.push<object_t>(aClient, "/attendance", jsonData, processData, "Push_Data");
-
-    Serial.println(F("Attendance sent to Firebase"));
+    
+    // Track pending operation
+    pendingOperations[syncId] = true;
+    syncState.pendingCount++;
+    syncState.status = SYNC_IN_PROGRESS;
+    
+    // Push to Firebase
+    Database.push<object_t>(aClient, "/attendance", jsonData, processData, syncId.c_str());
+    
+    Serial.print(F("📤 Sending attendance: "));
+    Serial.println(syncId);
+    
+    return syncId;
 }
 
-/**
- * Send pending user to Firebase for registration
- * Creates/updates entry in /pendingUsers/{uid}
- * @param uid - RFID card UID
- * @param timestamp - ISO 8601 timestamp
- */
+bool isSyncConfirmed(String syncId) {
+    if (confirmedOperations.count(syncId)) {
+        confirmedOperations.erase(syncId);  // Clean up after checking
+        return true;
+    }
+    return false;
+}
+
+String getLastSyncError() {
+    return syncState.lastError;
+}
+
+// =============================================================================
+// USER MANAGEMENT
+// =============================================================================
+
 void sendPendingUser(String uid, String timestamp) {
-    while (!app.ready()) {
-        Serial.println(F("Firebase not ready, waiting..."));
+    if (!app.ready()) {
         app.loop();
         delay(100);
+        if (!app.ready()) return;
     }
-
-    object_t obj3, obj4;
     
     writer.create(obj1, "uid", uid);
     writer.create(obj2, "status", "pending");
     writer.create(obj3, "firstScannedAt", timestamp);
     writer.create(obj4, "lastScannedAt", timestamp);
-    
     writer.join(jsonData, 4, obj1, obj2, obj3, obj4);
-
-    // Use set instead of push to avoid duplicates (uid as key)
+    
     String path = "/pendingUsers/" + uid;
     Database.set<object_t>(aClient, path.c_str(), jsonData, processData, "Set_Pending");
-
-    Serial.print(F("Pending user sent: "));
-    Serial.println(uid);
+    
+    Serial.printf("📤 Pending user sent: %s\n", uid.c_str());
 }
 
-/**
- * Send registered user to Firebase
- * Creates entry in /users/{uid}
- * @param uid - RFID card UID
- * @param name - User's name
- * @param timestamp - ISO 8601 timestamp of registration
- */
 void sendRegisteredUser(String uid, String name, String timestamp) {
-    while (!app.ready()) {
-        Serial.println(F("Firebase not ready, waiting..."));
-        app.loop();
-        delay(100);
-    }
-
-    object_t obj3, obj4;
+    if (!app.ready()) return;
     
     writer.create(obj1, "name", name);
     writer.create(obj2, "status", "registered");
     writer.create(obj3, "registeredAt", timestamp);
     writer.create(obj4, "uid", uid);
-    
     writer.join(jsonData, 4, obj1, obj2, obj3, obj4);
-
+    
     String path = "/users/" + uid;
     Database.set<object_t>(aClient, path.c_str(), jsonData, processData, "Set_User");
-
-    Serial.print(F("User registered: "));
-    Serial.print(name);
-    Serial.print(F(" ("));
-    Serial.print(uid);
-    Serial.println(F(")"));
+    
+    Serial.printf("📤 User registered: %s (%s)\n", name.c_str(), uid.c_str());
 }
 
 void fetchAllUsersFromFirebase() {
-    while (!app.ready()) { app.loop(); delay(10); }
-    // Request the /users node asynchronously; the result will arrive in processData
-    // with the task/tag "Get_Users" and the JSON payload.
+    int attempts = 0;
+    while (!app.ready() && attempts < 50) {
+        app.loop();
+        delay(10);
+        attempts++;
+    }
+    
+    if (!app.ready()) {
+        Serial.println(F("⚠️ Firebase not ready for user fetch"));
+        return;
+    }
+    
     Database.get(aClient, "/users", processData, "Get_Users");
-    Serial.println(F("Requested users from Firebase (async)"));
+    Serial.println(F("📥 Requested users from Firebase"));
 }
 
-/**
- * Fetch a single user from Firebase (/users/{uid}) asynchronously.
- * The response will be handled in processData() with tag "Get_User_<UID>".
- */
 void fetchUserFromFirebase(String uid) {
-    while (!app.ready()) { app.loop(); delay(10); }
-    String u = uid;
-    u.toUpperCase();
-    String path = "/users/" + u;
-    String tag = "Get_User_" + u;
+    if (!app.ready()) return;
+    
+    uid.toUpperCase();
+    String path = "/users/" + uid;
+    String tag = "Get_User_" + uid;
+    
     Database.get(aClient, path.c_str(), processData, tag.c_str());
-    Serial.print(F("Requested user from Firebase: "));
-    Serial.println(u);
+    Serial.printf("📥 Requested user: %s\n", uid.c_str());
 }
 
-/**
- * Start streaming /users to detect realtime changes.
- * When a pending user is approved and added to /users, 
- * the ESP will receive the event and register them automatically.
- */
 void streamUsers() {
-    while (!app.ready()) { app.loop(); delay(10); }
+    int attempts = 0;
+    while (!app.ready() && attempts < 50) {
+        app.loop();
+        delay(10);
+        attempts++;
+    }
+    
+    if (!app.ready()) {
+        Serial.println(F("⚠️ Firebase not ready for streaming"));
+        return;
+    }
+    
     Database.get(aClient, "/users", processData, true, "UserStream");
+    userStreamActive = true;
+    lastStreamActivity = millis();
     Serial.println(F("✓ Streaming /users for realtime updates"));
 }
 
+void stopUserStream() {
+    // Note: FirebaseClient doesn't have explicit stream stop
+    // The stream will timeout naturally
+    userStreamActive = false;
+    Serial.println(F("🛑 User stream stopped"));
+}
+
+bool isUserStreamActive() {
+    // Consider stream inactive if no activity for 60 seconds
+    if (userStreamActive && (millis() - lastStreamActivity > 60000)) {
+        userStreamActive = false;
+    }
+    return userStreamActive;
+}
+
+// =============================================================================
+// SYNC STATE
+// =============================================================================
+
+SyncState getSyncState() {
+    return syncState;
+}
+
+void resetSyncCounters() {
+    syncState.successCount = 0;
+    syncState.failCount = 0;
+    syncState.pendingCount = 0;
+    confirmedOperations.clear();
+    pendingOperations.clear();
+}
+
+void setUserChangeCallback(UserChangeCallback callback) {
+    userChangeCallback = callback;
+}
