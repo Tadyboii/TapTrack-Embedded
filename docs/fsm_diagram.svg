@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+  <style>
+    .state { fill:#f8f9fa; stroke:#343a40; stroke-width:2; rx:6; }
+    .text { font-family: Arial, Helvetica, sans-serif; font-size:13px; fill:#212529; }
+    .title { font-weight:700; font-size:14px; }
+    .note { font-size:12px; fill:#495057; }
+    .arrow { stroke:#495057; stroke-width:2; marker-end: url(#arrowhead); }
+  </style>
+
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#495057" />
+    </marker>
+  </defs>
+
+  <!-- States -->
+  <rect class="state" x="40" y="30" width="220" height="60" />
+  <text class="text title" x="150" y="55" text-anchor="middle">STATE_INITIALIZE</text>
+  <text class="text" x="150" y="72" text-anchor="middle">boot &amp; init</text>
+
+  <rect class="state" x="340" y="30" width="260" height="60" />
+  <text class="text title" x="470" y="55" text-anchor="middle">STATE_IDLE</text>
+  <text class="text" x="470" y="72" text-anchor="middle">background tasks &amp; polling</text>
+
+  <rect class="state" x="340" y="140" width="260" height="80" />
+  <text class="text title" x="470" y="165" text-anchor="middle">STATE_PROCESS_CARD</text>
+  <text class="text" x="470" y="182" text-anchor="middle">read UID, validate, lookup</text>
+  <text class="text" x="470" y="200" text-anchor="middle">immediate non-blocking beep</text>
+
+  <rect class="state" x="40" y="260" width="220" height="60" />
+  <text class="text title" x="150" y="285" text-anchor="middle">STATE_UPLOAD_DATA</text>
+  <text class="text" x="150" y="302" text-anchor="middle">non-blocking sendToFirebase</text>
+
+  <rect class="state" x="340" y="280" width="260" height="60" />
+  <text class="text title" x="470" y="305" text-anchor="middle">STATE_QUEUE_DATA</text>
+  <text class="text" x="470" y="322" text-anchor="middle">enqueue attendance locally</text>
+
+  <rect class="state" x="700" y="140" width="220" height="60" />
+  <text class="text title" x="810" y="165" text-anchor="middle">STATE_SYNC_QUEUE</text>
+  <text class="text" x="810" y="182" text-anchor="middle">publish queued record</text>
+
+  <!-- Arrows -->
+  <line class="arrow" x1="260" y1="60" x2="340" y2="60" />
+  <line class="arrow" x1="470" y1="110" x2="470" y2="140" />
+  <line class="arrow" x1="470" y1="220" x2="200" y2="260" />
+  <line class="arrow" x1="200" y1="290" x2="340" y2="290" />
+  <line class="arrow" x1="600" y1="170" x2="700" y2="170" />
+  <line class="arrow" x1="600" y1="310" x2="700" y2="170" />
+  <line class="arrow" x1="470" y1="340" x2="470" y2="340" />
+
+  <!-- Decision labels -->
+  <text class="text" x="365" y="125">card detected (ISR sets flag)</text>
+  <text class="text" x="220" y="245">if registered &amp; online</text>
+  <text class="text" x="460" y="245">if upload fails or offline</text>
+
+  <!-- Notes -->
+  <text class="note" x="40" y="360">Notes: immediate beep on UID read; sendToFirebase returns syncId or fails;</text>
+  <text class="note" x="40" y="380">uploadTracker in STATE_IDLE polls for confirmation; Firebase init/retry serviced by serviceFirebaseTasks()</text>
+
+</svg>
