@@ -1,14 +1,9 @@
 /*
  * TapTrack - ESP32 RFID Attendance System
- * Main Application Entry Point
+ * Main Application Entry Point - FSM Architecture
  * 
- * Features:
- * - RFID card reading with interrupt
- * - Firebase real-time sync
- * - Offline mode with local queue
- * - Online/offline mode toggle
- * - User database with Firebase streaming
- * - LED and buzzer feedback
+ * State Machine:
+ * INITIALIZE → IDLE → PROCESS_CARD → UPLOAD_DATA/QUEUE_DATA → IDLE
  */
 
 #include <Arduino.h>
@@ -27,6 +22,18 @@
 #include "gpio.h"
 
 // =============================================================================
+// STATE MACHINE DEFINITION
+// =============================================================================
+
+enum SystemState {
+    STATE_INITIALIZE,
+    STATE_IDLE,
+    STATE_PROCESS_CARD,
+    STATE_UPLOAD_DATA,
+    STATE_QUEUE_DATA
+};
+
+// =============================================================================
 // GLOBAL INSTANCES
 // =============================================================================
 
@@ -37,30 +44,103 @@ AttendanceQueue attendanceQueue;
 // SYSTEM STATE
 // =============================================================================
 
+static SystemState currentState = STATE_INITIALIZE;
+static SystemState previousState = STATE_INITIALIZE;
+
 static SystemMode currentMode = DEFAULT_SYSTEM_MODE;
 static bool isOnline = false;
-bool firebaseInitialized = false;  // Non-static - accessed by Firebase.cpp
-static bool streamActive = false;
+bool firebaseInitialized = false;
+
+// State machine data context
+struct StateContext {
+    String cardUID;
+    String userName;
+    String timestamp;
+    String attendanceStatus;
+    String registrationStatus;
+    bool isRegistered;
+    
+    String syncId;
+    unsigned long syncStartTime;
+    int uploadRetries;
+    
+    void reset() {
+        cardUID = "";
+        userName = "";
+        timestamp = "";
+        attendanceStatus = "";
+        registrationStatus = "";
+        isRegistered = false;
+        syncId = "";
+        syncStartTime = 0;
+        uploadRetries = 0;
+    }
+};
+
+static StateContext stateContext;
 
 // Timing
-static unsigned long lastSyncAttempt = 0;
 static unsigned long lastWifiCheck = 0;
 static unsigned long lastIndicatorUpdate = 0;
 static unsigned long lastButtonCheck = 0;
+static unsigned long lastQueueSyncAttempt = 0;
 
 // Duplicate tap prevention
 static String lastTapUID = "";
 static unsigned long lastTapTime = 0;
 
-// Sync tracking
-static String pendingSyncId = "";
-static unsigned long syncStartTime = 0;
-
 // =============================================================================
 // FORWARD DECLARATIONS
 // =============================================================================
 
-void toggleMode();
+void transitionTo(SystemState newState);
+void handleInitialize();
+void handleIdle();
+void handleProcessCard();
+void handleUploadData();
+void handleQueueData();
+
+// =============================================================================
+// STATE TRANSITION
+// =============================================================================
+
+void transitionTo(SystemState newState) {
+    if (currentState == newState) return;
+    
+    // State exit actions
+    switch (currentState) {
+        case STATE_PROCESS_CARD:
+            indicateProcessing(false);
+            break;
+        case STATE_UPLOAD_DATA:
+            indicateSyncing(false);
+            break;
+        default:
+            break;
+    }
+    
+    previousState = currentState;
+    currentState = newState;
+    
+    // Debug output
+    const char* stateNames[] = {"INITIALIZE", "IDLE", "PROCESS_CARD", "UPLOAD_DATA", "QUEUE_DATA"};
+    Serial.printf("[STATE] %s -> %s\n", stateNames[previousState], stateNames[currentState]);
+    
+    // State entry actions
+    switch (newState) {
+        case STATE_IDLE:
+            clearIndicators();
+            break;
+        case STATE_PROCESS_CARD:
+            indicateProcessing(true);
+            break;
+        case STATE_UPLOAD_DATA:
+            indicateSyncing(true);
+            break;
+        default:
+            break;
+    }
+}
 
 // =============================================================================
 // BUTTON HANDLING
@@ -69,56 +149,53 @@ void toggleMode();
 static bool modeButtonPressed = false;
 static unsigned long modeButtonPressTime = 0;
 
+void toggleMode();
+
 void checkModeButton() {
     static bool lastButtonState = HIGH;
-    bool currentState = gpio_read(MODE_BUTTON_PIN);
+    bool currentButtonState = gpio_read(MODE_BUTTON_PIN);
     
-    // Debounce
-    if (currentState != lastButtonState) {
+    if (currentButtonState != lastButtonState) {
         delay(BUTTON_DEBOUNCE_MS);
-        currentState = gpio_read(MODE_BUTTON_PIN);
+        currentButtonState = gpio_read(MODE_BUTTON_PIN);
     }
     
-    if (currentState == LOW && lastButtonState == HIGH) {
-        // Button just pressed
+    if (currentButtonState == LOW && lastButtonState == HIGH) {
         modeButtonPressTime = millis();
         modeButtonPressed = true;
     }
     
-    if (currentState == HIGH && lastButtonState == LOW && modeButtonPressed) {
-        // Button released
+    if (currentButtonState == HIGH && lastButtonState == LOW && modeButtonPressed) {
         unsigned long pressDuration = millis() - modeButtonPressTime;
         modeButtonPressed = false;
         
         if (pressDuration > 3000) {
-            // Long press: Reset WiFi credentials
-            Serial.println(F("\n🔄 Long press detected - Clearing WiFi credentials"));
+            Serial.println(F("\n[BUTTON] Long press - Clearing WiFi credentials"));
             clearWiFiCredentials();
             beepLong();
             delay(1000);
             ESP.restart();
         } else if (pressDuration > 100) {
-            // Short press: Toggle mode
             toggleMode();
         }
     }
     
-    lastButtonState = currentState;
+    lastButtonState = currentButtonState;
 }
 
 void toggleMode() {
     switch (currentMode) {
         case MODE_AUTO:
             currentMode = MODE_FORCE_ONLINE;
-            Serial.println(F("📶 Mode: FORCE ONLINE"));
+            Serial.println(F("[MODE] FORCE ONLINE"));
             break;
         case MODE_FORCE_ONLINE:
             currentMode = MODE_FORCE_OFFLINE;
-            Serial.println(F("📴 Mode: FORCE OFFLINE"));
+            Serial.println(F("[MODE] FORCE OFFLINE"));
             break;
         case MODE_FORCE_OFFLINE:
             currentMode = MODE_AUTO;
-            Serial.println(F("🔄 Mode: AUTO"));
+            Serial.println(F("[MODE] AUTO"));
             break;
     }
     
@@ -126,7 +203,6 @@ void toggleMode() {
     indicateMode(currentMode);
     beepSuccess();
     
-    // React to mode change
     if (currentMode == MODE_FORCE_OFFLINE) {
         isOnline = false;
     } else if (currentMode == MODE_FORCE_ONLINE && isWiFiConnected()) {
@@ -158,6 +234,7 @@ String getAttendanceStatus(const DateTime& time) {
     } else if (time.hour >= LATE_HOUR) {
         return "late";
     }
+    return "present";
 }
 
 String formatTimestamp(const DateTime& time) {
@@ -172,7 +249,7 @@ bool isDuplicateTap(String uid) {
     unsigned long now = millis();
     
     if (lastTapUID == uid && (now - lastTapTime) < TAP_COOLDOWN_MS) {
-        Serial.printf(" Duplicate tap (wait %lu sec)\n", 
+        Serial.printf("[WARN] Duplicate tap (wait %lu sec)\n", 
                      (TAP_COOLDOWN_MS - (now - lastTapTime)) / 1000);
         return true;
     }
@@ -194,15 +271,14 @@ bool checkAndReconnectWiFi() {
     
     if (isWiFiConnected()) {
         if (!isOnline) {
-            Serial.println(F("🌐 WiFi reconnected!"));
+            Serial.println(F("[WIFI] Reconnected"));
             isOnline = true;
             
             if (!firebaseInitialized && currentMode != MODE_FORCE_OFFLINE) {
-                Serial.println(F("🔥 Reinitializing Firebase..."));
+                Serial.println(F("[FIREBASE] Reinitializing..."));
                 initFirebase();
                 firebaseInitialized = true;
                 
-                // Restart user stream
                 if (!isUserStreamActive()) {
                     streamUsers();
                 }
@@ -211,12 +287,12 @@ bool checkAndReconnectWiFi() {
         return true;
     } else {
         if (isOnline) {
-            Serial.println(F("⚠️ WiFi disconnected"));
+            Serial.println(F("[WIFI] Disconnected"));
             isOnline = false;
         }
         
         if (currentMode == MODE_FORCE_ONLINE) {
-            Serial.println(F("📶 Attempting reconnection..."));
+            Serial.println(F("[WIFI] Attempting reconnection..."));
             indicateConnecting(true);
             bool connected = reconnectWiFi();
             indicateConnecting(false);
@@ -229,100 +305,266 @@ bool checkAndReconnectWiFi() {
 }
 
 // =============================================================================
-// SYNC QUEUE
+// USER CHANGE CALLBACK
 // =============================================================================
 
-void syncQueuedAttendance() {
-    if (!isOnline || attendanceQueue.isEmpty()) {
-        return;
-    }
-    
-    if (currentMode == MODE_FORCE_OFFLINE) {
-        return;
-    }
-    
-    // Check if previous sync completed
-    if (pendingSyncId.length() > 0) {
-        if (isSyncConfirmed(pendingSyncId)) {
-            // Previous sync confirmed - remove from queue
-            attendanceQueue.dequeueBySyncId(pendingSyncId);
-            pendingSyncId = "";
-        } else if (millis() - syncStartTime > 10000) {
-            // Timeout - retry later
-            Serial.println(F("⚠️ Sync timeout, will retry"));
-            attendanceQueue.moveToBack();
-            pendingSyncId = "";
-        } else {
-            // Still waiting for confirmation
-            return;
-        }
-    }
-    
-    // Process next record
-    AttendanceRecord* record = attendanceQueue.peek();
-    if (!record) return;
-    
-    // Check retry limit
-    if (record->retryCount > 5) {
-        Serial.println(F("❌ Max retries reached, moving to back"));
-        attendanceQueue.moveToBack();
-        return;
-    }
-    
-    if (!isFirebaseReady()) {
-        app.loop();
-        return;
-    }
-    
-    indicateSyncing(true);
-    
-    Serial.printf("📤 Syncing: %s\n", 
-                 record->name.length() > 0 ? record->name.c_str() : record->uid.c_str());
-    
-    pendingSyncId = sendToFirebase(
-        record->uid,
-        record->name,
-        record->timestamp,
-        record->attendanceStatus,
-        record->registrationStatus
-    );
-    
-    if (pendingSyncId.length() > 0) {
-        attendanceQueue.setSyncId(pendingSyncId);
-        syncStartTime = millis();
+void onUserChange(String uid, String name, bool added) {
+    if (added) {
+        Serial.printf("[STREAM] User added: %s (%s)\n", name.c_str(), uid.c_str());
+        beepSuccess();
     } else {
-        indicateSyncing(false);
+        Serial.printf("[STREAM] User removed: %s\n", uid.c_str());
+        beepDouble();
     }
 }
 
 // =============================================================================
-// CARD PROCESSING
+// STATE HANDLERS
 // =============================================================================
 
-void processCard(String uid) {
+void handleInitialize() {
+    Serial.println(F("\n╔════════════════════════════════════════╗"));
+    Serial.println(F("║     TapTrack Attendance System         ║"));
+    Serial.println(F("║        [FSM Architecture]              ║"));
+    Serial.println(F("╚════════════════════════════════════════╝\n"));
+    
+    // Initialize SPI
+    SPI.begin();
+    
+    // Startup LED sequence
+    initIndicator();
+    startupSequence();
+    
+    // Initialize SPIFFS
+    Serial.println(F("[SPIFFS] Initializing storage..."));
+    if (!SPIFFS.begin(true)) {
+        Serial.println(F("[SPIFFS] Mount failed, formatting..."));
+        SPIFFS.format();
+        SPIFFS.begin(true);
+    }
+    Serial.println(F("[SPIFFS] Ready"));
+    
+    // Initialize User Database
+    Serial.println(F("[DB] Loading user database..."));
+    userDB.init();
+    Serial.printf("[DB] %d users loaded\n", userDB.getUserCount());
+    
+    // Initialize Attendance Queue
+    Serial.println(F("[QUEUE] Loading attendance queue..."));
+    attendanceQueue.init();
+    if (!attendanceQueue.isEmpty()) {
+        Serial.printf("[QUEUE] %d queued records found\n", attendanceQueue.size());
+    }
+    
+    // Load saved mode
+    currentMode = loadSystemMode();
+    Serial.printf("[MODE] %s\n", 
+                 currentMode == MODE_AUTO ? "AUTO" :
+                 currentMode == MODE_FORCE_ONLINE ? "FORCE ONLINE" : "FORCE OFFLINE");
+    
+    // Initialize WiFi
+    Serial.println(F("\n[WIFI] Initializing..."));
+    bool wifiConnected = initWiFiManager();
+    isOnline = wifiConnected && (currentMode != MODE_FORCE_OFFLINE);
+    
+    if (isOnline) {
+        Serial.println(F("[WIFI] Connected"));
+        Serial.print(F("[WIFI] IP: "));
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println(F("[WIFI] Running in OFFLINE mode"));
+    }
+    
+    // Initialize RFID
+    Serial.println(F("\n[RFID] Initializing..."));
+    initRFID();
+    if (isRFIDHealthy()) {
+        Serial.println(F("[RFID] Ready"));
+    } else {
+        Serial.println(F("[RFID] Module not detected!"));
+    }
+    
+    // Initialize RTC
+    Serial.println(F("\n[RTC] Initializing..."));
+    if (isOnline) {
+        setupAndSyncRTC();
+    } else {
+        rtc.begin();
+        DateTime now = getCurrentTime();
+        Serial.printf("[RTC] Time: %02d/%02d/%04d %02d:%02d:%02d\n",
+                     now.month, now.day, now.year,
+                     now.hour, now.minute, now.second);
+        if (!isRTCValid(now)) {
+            Serial.println(F("[RTC] Time may be invalid!"));
+        }
+    }
+    Serial.println(F("[RTC] Ready"));
+    
+    // Initialize Firebase if online
+    if (isOnline && currentMode != MODE_FORCE_OFFLINE) {
+        Serial.println(F("\n[FIREBASE] Initializing..."));
+        initFirebase();
+        
+        int attempts = 0;
+        while (!app.ready() && attempts < 100) {
+            app.loop();
+            delay(50);
+            attempts++;
+        }
+        
+        if (app.ready()) {
+            firebaseInitialized = true;
+            Serial.println(F("[FIREBASE] Connected"));
+            
+            setUserChangeCallback(onUserChange);
+            fetchAllUsersFromFirebase();
+            delay(2000);
+            app.loop();
+            streamUsers();
+            
+            if (!attendanceQueue.isEmpty()) {
+                Serial.printf("[SYNC] %d queued records ready for sync\n", attendanceQueue.size());
+            }
+        } else {
+            Serial.println(F("[FIREBASE] Connection timeout"));
+        }
+    }
+    
+    // Setup mode button
+    gpio_pin_init_pullup(MODE_BUTTON_PIN, GPIO_INPUT_MODE, GPIO_PULL_UP);
+    
+    // Setup RFID interrupt
+    gpio_pin_init_pullup(RFID_IRQ_PIN, GPIO_INPUT_MODE, GPIO_PULL_UP);
+    enableInterrupt();
+    cardDetected = false;
+    attachInterrupt(digitalPinToInterrupt(RFID_IRQ_PIN), readCardISR, FALLING);
+    
+    // Show status
+    userDB.printAllUsers();
+    if (!attendanceQueue.isEmpty()) {
+        attendanceQueue.printQueue();
+    }
+    
+    Serial.println(F("\n╔════════════════════════════════════════╗"));
+    Serial.println(F("║           System Ready!                ║"));
+    Serial.println(F("╚════════════════════════════════════════╝"));
+    Serial.printf("Mode: %s | Online: %s\n",
+                 currentMode == MODE_AUTO ? "AUTO" :
+                 currentMode == MODE_FORCE_ONLINE ? "ONLINE" : "OFFLINE",
+                 isOnline ? "Yes" : "No");
+    Serial.println(F("\nTap RFID card to record attendance"));
+    Serial.println(F("Type 'help' for commands\n"));
+    
+    indicateMode(currentMode);
+    
+    // Transition to IDLE
+    transitionTo(STATE_IDLE);
+}
+
+void handleIdle() {
+    unsigned long now = millis();
+    
+    // Background tasks
+    checkAndResetMFRC522();
+    
+    if (now - lastButtonCheck > 50) {
+        lastButtonCheck = now;
+        checkModeButton();
+    }
+    
+    if (now - lastIndicatorUpdate > 50) {
+        lastIndicatorUpdate = now;
+        updateIndicator();
+    }
+    
+    if (currentMode != MODE_FORCE_OFFLINE && (now - lastWifiCheck > WIFI_CHECK_INTERVAL_MS)) {
+        lastWifiCheck = now;
+        checkAndReconnectWiFi();
+    }
+    
+    // Process Firebase events
+    if (isOnline && firebaseInitialized) {
+        app.loop();
+    }
+    
+    // Periodic queue sync (only if not currently processing a card)
+    if (isOnline && !attendanceQueue.isEmpty() && 
+        currentMode != MODE_FORCE_OFFLINE &&
+        (now - lastQueueSyncAttempt > SYNC_INTERVAL_MS)) {
+        lastQueueSyncAttempt = now;
+        
+        // Check if we should transition to UPLOAD_DATA for queue processing
+        AttendanceRecord* record = attendanceQueue.peek();
+        if (record && record->retryCount <= 5) {
+            stateContext.reset();
+            stateContext.cardUID = record->uid;
+            stateContext.userName = record->name;
+            stateContext.timestamp = record->timestamp;
+            stateContext.attendanceStatus = record->attendanceStatus;
+            stateContext.registrationStatus = record->registrationStatus;
+            stateContext.isRegistered = true;
+            
+            Serial.println(F("[QUEUE] Processing queued record..."));
+            transitionTo(STATE_UPLOAD_DATA);
+            return;
+        }
+    }
+    
+    // Check for card detection
+    if (cardDetected) {
+        delay(50); // Card stabilization
+        transitionTo(STATE_PROCESS_CARD);
+        return;
+    }
+    
+    activateRec();
+}
+
+void handleProcessCard() {
+    // Read card UID
+    String uid = readCardUID();
+    
+    if (uid.length() == 0) {
+        Serial.println(F("[ERROR] Failed to read card. Try again."));
+        indicateError();
+        clearInt();
+        cardDetected = false;
+        transitionTo(STATE_IDLE);
+        return;
+    }
+    
     // Get current time
     DateTime time = getCurrentTime();
     
     // Validate RTC
     if (!isRTCValid(time)) {
-        Serial.println(F("❌ RTC time invalid!"));
+        Serial.println(F("[ERROR] RTC time invalid!"));
         indicateErrorRTC();
+        clearInt();
+        cardDetected = false;
+        transitionTo(STATE_IDLE);
         return;
     }
     
     // Check duplicate tap
     if (isDuplicateTap(uid)) {
+        clearInt();
+        cardDetected = false;
+        transitionTo(STATE_IDLE);
         return;
     }
     
-    // Format timestamp
-    String timestamp = formatTimestamp(time);
+    // Populate state context
+    stateContext.reset();
+    stateContext.cardUID = uid;
+    stateContext.timestamp = formatTimestamp(time);
+    stateContext.attendanceStatus = getAttendanceStatus(time);
     
     // Lookup user
     UserInfo userInfo = userDB.getUserInfo(uid);
-    String name = userInfo.name;
-    String registrationStatus = userInfo.isRegistered ? "registered" : "unregistered";
-    String attendanceStatus = getAttendanceStatus(time);
+    stateContext.userName = userInfo.name;
+    stateContext.isRegistered = userInfo.isRegistered;
+    stateContext.registrationStatus = userInfo.isRegistered ? "registered" : "unregistered";
     
     // Print info
     Serial.println(F("\n========================================"));
@@ -331,52 +573,127 @@ void processCard(String uid) {
                  time.month, time.day, time.year,
                  time.hour, time.minute, time.second);
     
-    if (userInfo.isRegistered) {
-        Serial.printf("User: %s (Registered)\n", name.c_str());
+    if (stateContext.isRegistered) {
+        Serial.printf("User: %s (Registered)\n", stateContext.userName.c_str());
         userDB.recordTap(uid);
     } else {
         Serial.println(F("User: Unknown (Unregistered)"));
     }
     Serial.println(F("========================================\n"));
     
-    // Process based on mode and connectivity
+    // Clear interrupt
+    clearInt();
+    cardDetected = false;
+    
+    // Decide next state based on connectivity and registration
     if (isOnline && currentMode != MODE_FORCE_OFFLINE) {
-        if (userInfo.isRegistered) {
-            // Send attendance directly
-            String syncId = sendToFirebase(uid, name, timestamp, 
-                                          attendanceStatus, registrationStatus);
-            if (syncId.length() > 0) {
-                indicateSuccessOnline();
-            } else {
-                // Firebase send failed - queue locally
-                attendanceQueue.enqueue(uid, name, timestamp, 
-                                       attendanceStatus, registrationStatus);
-                indicateSuccessQueued();
-            }
+        // ONLINE PATH
+        if (stateContext.isRegistered) {
+            transitionTo(STATE_UPLOAD_DATA);
         } else {
             // Unregistered - send to pending users
-            Serial.println(F("➤ Sending to pending users"));
-            sendPendingUser(uid, timestamp);
-            fetchUserFromFirebase(uid);  // Check if recently registered
+            Serial.println(F("[PENDING] Sending to pending users"));
+            sendPendingUser(uid, stateContext.timestamp);
+            fetchUserFromFirebase(uid);
             indicateSuccessOnline();
+            transitionTo(STATE_IDLE);
         }
     } else {
-        // OFFLINE MODE
-        if (userInfo.isRegistered) {
-            if (attendanceQueue.isFull()) {
-                Serial.println(F("❌ Queue full! Cannot record attendance."));
-                indicateErrorQueueFull();
-            } else {
-                Serial.println(F("📴 Offline - Queuing locally"));
-                attendanceQueue.enqueue(uid, name, timestamp, 
-                                       attendanceStatus, registrationStatus);
-                indicateSuccessOffline();
-            }
+        // OFFLINE PATH
+        if (stateContext.isRegistered) {
+            transitionTo(STATE_QUEUE_DATA);
         } else {
-            Serial.println(F("⚠️ Offline + Unregistered - Cannot process"));
+            Serial.println(F("[ERROR] Offline + Unregistered - Cannot process"));
             indicateErrorUnregistered();
+            transitionTo(STATE_IDLE);
         }
     }
+}
+
+void handleUploadData() {
+    // Check if still online
+    if (!isOnline || !isFirebaseReady()) {
+        Serial.println(F("[WARN] Lost connection during upload"));
+        transitionTo(STATE_QUEUE_DATA);
+        return;
+    }
+    
+    // Attempt upload
+    stateContext.syncId = sendToFirebase(
+        stateContext.cardUID,
+        stateContext.userName,
+        stateContext.timestamp,
+        stateContext.attendanceStatus,
+        stateContext.registrationStatus
+    );
+    
+    if (stateContext.syncId.length() > 0) {
+        // Upload initiated - wait for confirmation
+        stateContext.syncStartTime = millis();
+        
+        // Poll for confirmation (non-blocking with timeout)
+        int maxWait = 50; // 50 * 100ms = 5 seconds max
+        int waitCount = 0;
+        
+        while (waitCount < maxWait) {
+            app.loop();
+            
+            if (isSyncConfirmed(stateContext.syncId)) {
+                Serial.println(F("[SYNC] Upload confirmed"));
+                
+                // If this was from the queue, remove it
+                if (!attendanceQueue.isEmpty()) {
+                    AttendanceRecord* record = attendanceQueue.peek();
+                    if (record && record->uid == stateContext.cardUID) {
+                        attendanceQueue.dequeueBySyncId(stateContext.syncId);
+                    }
+                }
+                
+                indicateSuccessOnline();
+                transitionTo(STATE_IDLE);
+                return;
+            }
+            
+            delay(100);
+            waitCount++;
+        }
+        
+        // Timeout - queue it
+        Serial.println(F("[WARN] Upload timeout"));
+        transitionTo(STATE_QUEUE_DATA);
+    } else {
+        // Upload failed immediately
+        Serial.println(F("[ERROR] Upload failed"));
+        stateContext.uploadRetries++;
+        
+        if (stateContext.uploadRetries > 2) {
+            transitionTo(STATE_QUEUE_DATA);
+        } else {
+            delay(500);
+            // Retry
+        }
+    }
+}
+
+void handleQueueData() {
+    if (attendanceQueue.isFull()) {
+        Serial.println(F("[ERROR] Queue full! Cannot record attendance."));
+        indicateErrorQueueFull();
+        transitionTo(STATE_IDLE);
+        return;
+    }
+    
+    Serial.println(F("[QUEUE] Queuing locally"));
+    attendanceQueue.enqueue(
+        stateContext.cardUID,
+        stateContext.userName,
+        stateContext.timestamp,
+        stateContext.attendanceStatus,
+        stateContext.registrationStatus
+    );
+    
+    indicateSuccessOffline();
+    transitionTo(STATE_IDLE);
 }
 
 // =============================================================================
@@ -393,7 +710,9 @@ void processSerialCommand() {
     Serial.printf("\n> %s\n", cmd.c_str());
     
     if (cmd == "status") {
+        const char* stateNames[] = {"INITIALIZE", "IDLE", "PROCESS_CARD", "UPLOAD_DATA", "QUEUE_DATA"};
         Serial.println(F("\n=== System Status ==="));
+        Serial.printf("State: %s\n", stateNames[currentState]);
         Serial.printf("Mode: %s\n", 
                      currentMode == MODE_AUTO ? "AUTO" :
                      currentMode == MODE_FORCE_ONLINE ? "FORCE ONLINE" : "FORCE OFFLINE");
@@ -404,10 +723,6 @@ void processSerialCommand() {
         Serial.printf("Users: %d\n", userDB.getUserCount());
         Serial.printf("Queue: %d/%d\n", attendanceQueue.size(), MAX_QUEUE_SIZE);
         Serial.println(F("=====================\n"));
-    }
-    else if (cmd == "sync") {
-        Serial.println(F("Forcing sync..."));
-        syncQueuedAttendance();
     }
     else if (cmd == "mode auto") {
         currentMode = MODE_AUTO;
@@ -461,7 +776,6 @@ void processSerialCommand() {
     else if (cmd == "help") {
         Serial.println(F("\n=== Commands ==="));
         Serial.println(F("status      - Show system status"));
-        Serial.println(F("sync        - Force queue sync"));
         Serial.println(F("mode auto   - Set auto mode"));
         Serial.println(F("mode online - Set force online mode"));
         Serial.println(F("mode offline- Set force offline mode"));
@@ -481,252 +795,43 @@ void processSerialCommand() {
 }
 
 // =============================================================================
-// USER CHANGE CALLBACK
-// =============================================================================
-
-void onUserChange(String uid, String name, bool added) {
-    if (added) {
-        Serial.printf("📥 User added via stream: %s (%s)\n", name.c_str(), uid.c_str());
-        beepSuccess();
-    } else {
-        Serial.printf("📤 User removed via stream: %s\n", uid.c_str());
-        beepDouble();
-    }
-}
-
-// =============================================================================
-// SETUP
+// SETUP & MAIN LOOP
 // =============================================================================
 
 void setup() {
     Serial.begin(115200);
     while (!Serial) delay(10);
     
-    Serial.println(F("\n"));
-    Serial.println(F("╔════════════════════════════════════════╗"));
-    Serial.println(F("║     TapTrack Attendance System         ║"));
-    Serial.println(F("║        [Enhanced Edition]              ║"));
-    Serial.println(F("╚════════════════════════════════════════╝"));
-    Serial.println();
-    
-    // Initialize SPI
-    SPI.begin();
-    
-    // Startup LED sequence
-    initIndicator();
-    startupSequence();
-    
-    // Initialize SPIFFS
-    Serial.println(F("💾 Initializing storage..."));
-    if (!SPIFFS.begin(true)) {
-        Serial.println(F("⚠️ SPIFFS mount failed, formatting..."));
-        SPIFFS.format();
-        SPIFFS.begin(true);
-    }
-    Serial.println(F("✓ SPIFFS ready"));
-    
-    // Initialize User Database
-    Serial.println(F("📂 Loading user database..."));
-    userDB.init();
-    Serial.printf("✓ %d users loaded\n", userDB.getUserCount());
-    
-    // Initialize Attendance Queue
-    Serial.println(F("📝 Loading attendance queue..."));
-    attendanceQueue.init();
-    if (!attendanceQueue.isEmpty()) {
-        Serial.printf("✓ %d queued records found\n", attendanceQueue.size());
-    }
-    
-    // Load saved mode
-    currentMode = loadSystemMode();
-    Serial.printf("📱 Mode: %s\n", 
-                 currentMode == MODE_AUTO ? "AUTO" :
-                 currentMode == MODE_FORCE_ONLINE ? "FORCE ONLINE" : "FORCE OFFLINE");
-    
-    // Initialize WiFi
-    Serial.println(F("\n🌐 Initializing WiFi..."));
-    bool wifiConnected = initWiFiManager();
-    isOnline = wifiConnected && (currentMode != MODE_FORCE_OFFLINE);
-    
-    if (isOnline) {
-        Serial.println(F("✅ WiFi Connected"));
-        Serial.print(F("   IP: "));
-        Serial.println(WiFi.localIP());
-    } else {
-        Serial.println(F("📴 Running in OFFLINE mode"));
-    }
-    
-    // Initialize RFID
-    Serial.println(F("\n📡 Initializing RFID..."));
-    initRFID();
-    if (isRFIDHealthy()) {
-        Serial.println(F("✓ RFID module ready"));
-    } else {
-        Serial.println(F("⚠️ RFID module not detected!"));
-    }
-    
-    // Initialize RTC
-    Serial.println(F("\n🕐 Initializing RTC..."));
-    if (isOnline) {
-        setupAndSyncRTC();
-    } else {
-        rtc.begin();
-        DateTime now = getCurrentTime();
-        Serial.printf("   Time: %02d/%02d/%04d %02d:%02d:%02d\n",
-                     now.month, now.day, now.year,
-                     now.hour, now.minute, now.second);
-        if (!isRTCValid(now)) {
-            Serial.println(F("⚠️ RTC time may be invalid!"));
-        }
-    }
-    Serial.println(F("✓ RTC ready"));
-    
-    // Initialize Firebase if online
-    if (isOnline && currentMode != MODE_FORCE_OFFLINE) {
-        Serial.println(F("\n🔥 Initializing Firebase..."));
-        initFirebase();
-        
-        // Wait for Firebase to be ready
-        int attempts = 0;
-        while (!app.ready() && attempts < 100) {
-            app.loop();
-            delay(50);
-            attempts++;
-        }
-        
-        if (app.ready()) {
-            firebaseInitialized = true;
-            Serial.println(F("✓ Firebase connected"));
-            
-            // Set user change callback
-            setUserChangeCallback(onUserChange);
-            
-            // Fetch users and start streaming
-            fetchAllUsersFromFirebase();
-            
-            // Wait a bit for users to load
-            delay(2000);
-            app.loop();
-            
-            // Start streaming for realtime updates
-            streamUsers();
-            
-            // Sync any queued attendance
-            if (!attendanceQueue.isEmpty()) {
-                Serial.printf("📤 Syncing %d queued records...\n", attendanceQueue.size());
-                delay(1000);
-            }
-        } else {
-            Serial.println(F("⚠️ Firebase connection timeout"));
-        }
-    }
-    
-    // Setup mode button
-    gpio_pin_init_pullup(MODE_BUTTON_PIN, GPIO_INPUT_MODE, GPIO_PULL_UP);
-    
-    // Setup RFID interrupt
-    gpio_pin_init_pullup(RFID_IRQ_PIN, GPIO_INPUT_MODE, GPIO_PULL_UP);
-    enableInterrupt();
-    cardDetected = false;
-    attachInterrupt(digitalPinToInterrupt(RFID_IRQ_PIN), readCardISR, FALLING);
-    
-    // Show registered users
-    userDB.printAllUsers();
-    
-    // Show queue status
-    if (!attendanceQueue.isEmpty()) {
-        attendanceQueue.printQueue();
-    }
-    
-    // Ready!
-    Serial.println(F("\n╔════════════════════════════════════════╗"));
-    Serial.println(F("║           System Ready!                ║"));
-    Serial.println(F("╚════════════════════════════════════════╝"));
-    Serial.printf("Mode: %s | Online: %s\n",
-                 currentMode == MODE_AUTO ? "AUTO" :
-                 currentMode == MODE_FORCE_ONLINE ? "ONLINE" : "OFFLINE",
-                 isOnline ? "Yes" : "No");
-    Serial.println(F("\n🎫 Tap RFID card to record attendance"));
-    Serial.println(F("📝 Type 'help' for commands\n"));
-    
-    // Show mode indicator
-    indicateMode(currentMode);
-    
-    delay(500);
+    // Start in INITIALIZE state
+    currentState = STATE_INITIALIZE;
 }
 
-// =============================================================================
-// MAIN LOOP
-// =============================================================================
-
 void loop() {
-    unsigned long now = millis();
-    
-    // Reset RFID module periodically
-    checkAndResetMFRC522();
-    
-    // Check mode button
-    if (now - lastButtonCheck > 50) {
-        lastButtonCheck = now;
-        checkModeButton();
-    }
-    
-    // Update indicators (for blinking states)
-    if (now - lastIndicatorUpdate > 50) {
-        lastIndicatorUpdate = now;
-        updateIndicator();
-    }
-    
-    // Periodic WiFi check
-    if (currentMode != MODE_FORCE_OFFLINE && (now - lastWifiCheck > WIFI_CHECK_INTERVAL_MS)) {
-        lastWifiCheck = now;
-        checkAndReconnectWiFi();
-    }
-    
-    // Process Firebase events
-    if (isOnline && firebaseInitialized) {
-        app.loop();
-        
-        // Check if sync completed
-        if (pendingSyncId.length() > 0 && isSyncConfirmed(pendingSyncId)) {
-            attendanceQueue.dequeueBySyncId(pendingSyncId);
-            pendingSyncId = "";
-            indicateSyncing(false);
-        }
-        
-        // Periodic queue sync
-        if (!attendanceQueue.isEmpty() && (now - lastSyncAttempt > SYNC_INTERVAL_MS)) {
-            lastSyncAttempt = now;
-            syncQueuedAttendance();
-        }
-    }
-    
-    // Process serial commands
+    // Process serial commands (available in all states)
     processSerialCommand();
     
-    // Process card detection
-    if (cardDetected) {
-        Serial.print("(Interrupt: Card Detected)"); 
-        indicateProcessing(true);
-
-        String uid = readCardUID();
-    
-        if (uid.length() > 0) {
-            processCard(uid);
-        } else {
-            Serial.println(" Failed to read UID. Try again.");
-            indicateError();
-        }
-        
-        // Clear and re-enable interrupt
-        clearInt();
-        cardDetected = false;
-        clearIndicators();
+    // Run state machine
+    switch (currentState) {
+        case STATE_INITIALIZE:
+            handleInitialize();
+            break;
+            
+        case STATE_IDLE:
+            handleIdle();
+            break;
+            
+        case STATE_PROCESS_CARD:
+            handleProcessCard();
+            break;
+            
+        case STATE_UPLOAD_DATA:
+            handleUploadData();
+            break;
+            
+        case STATE_QUEUE_DATA:
+            handleQueueData();
+            break;
     }
-
-    // Re-activate receiver
-    activateRec();
-
-    // Small delay
+    
     delay(10);
 }
