@@ -158,7 +158,6 @@ String getAttendanceStatus(const DateTime& time) {
     } else if (time.hour >= LATE_HOUR) {
         return "late";
     }
-    return "present";
 }
 
 String formatTimestamp(const DateTime& time) {
@@ -173,7 +172,7 @@ bool isDuplicateTap(String uid) {
     unsigned long now = millis();
     
     if (lastTapUID == uid && (now - lastTapTime) < TAP_COOLDOWN_MS) {
-        Serial.printf("⚠️ Duplicate tap (wait %lu sec)\n", 
+        Serial.printf(" Duplicate tap (wait %lu sec)\n", 
                      (TAP_COOLDOWN_MS - (now - lastTapTime)) / 1000);
         return true;
     }
@@ -707,17 +706,15 @@ void loop() {
     
     // Process card detection
     if (cardDetected) {
-        // Brief delay for card to stabilize
-        delay(50);
-        
+        Serial.print("(Interrupt: Card Detected)"); 
         indicateProcessing(true);
-        
+
         String uid = readCardUID();
-        
+    
         if (uid.length() > 0) {
             processCard(uid);
         } else {
-            Serial.println(F("⚠️ Failed to read card. Try again."));
+            Serial.println(" Failed to read UID. Try again.");
             indicateError();
         }
         
@@ -726,10 +723,10 @@ void loop() {
         cardDetected = false;
         clearIndicators();
     }
-    
+
     // Re-activate receiver
     activateRec();
-    
+
     // Small delay
     delay(10);
 }

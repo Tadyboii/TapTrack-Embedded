@@ -60,7 +60,7 @@
 
 // Time thresholds (24-hour format)
 #define ON_TIME_HOUR            9       // Before 9:00 AM is on time
-#define LATE_HOUR               9       // 9:00 AM and after is late
+#define LATE_HOUR               10       // 9:00 AM and after is late
 
 // Valid year range for RTC sanity check
 #define RTC_MIN_YEAR            2024

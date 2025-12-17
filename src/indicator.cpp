@@ -231,37 +231,37 @@ void clearIndicators() {
 
 void indicateSuccessOnline() {
     setIndicator(IND_SUCCESS_ONLINE, INDICATOR_DISPLAY_MS);
-    Serial.println(F("✅ Success (Online) - Green LED"));
+    // Serial.println(F("✅ Success (Online) - Green LED"));
 }
 
 void indicateSuccessOffline() {
     setIndicator(IND_SUCCESS_OFFLINE, INDICATOR_DISPLAY_MS);
-    Serial.println(F("⚠️ Success (Offline) - Yellow LED"));
+    // Serial.println(F("⚠️ Success (Offline) - Yellow LED"));
 }
 
 void indicateSuccessQueued() {
     setIndicator(IND_SUCCESS_QUEUED, INDICATOR_DISPLAY_MS);
-    Serial.println(F("📝 Queued - Yellow blink"));
+    // Serial.println(F("📝 Queued - Yellow blink"));
 }
 
 void indicateError() {
     setIndicator(IND_ERROR_GENERAL, INDICATOR_DISPLAY_MS);
-    Serial.println(F("❌ Error - Red LED"));
+    // Serial.println(F("❌ Error - Red LED"));
 }
 
 void indicateErrorUnregistered() {
     setIndicator(IND_ERROR_UNREGISTERED, INDICATOR_DISPLAY_MS);
-    Serial.println(F("❌ Unregistered - Red blink"));
+    // Serial.println(F("❌ Unregistered - Red blink"));
 }
 
 void indicateErrorQueueFull() {
     setIndicator(IND_ERROR_QUEUE_FULL, INDICATOR_DISPLAY_MS * 2);
-    Serial.println(F("❌ Queue Full - Red fast blink"));
+    // Serial.println(F("❌ Queue Full - Red fast blink"));
 }
 
 void indicateErrorRTC() {
     setIndicator(IND_ERROR_RTC_INVALID, INDICATOR_DISPLAY_MS);
-    Serial.println(F("❌ RTC Invalid - Red+Yellow"));
+    // Serial.println(F("❌ RTC Invalid - Red+Yellow"));
 }
 
 void indicateSyncing(bool active) {
@@ -316,9 +316,9 @@ void indicateMode(SystemMode mode) {
 // =============================================================================
 
 void beep(uint16_t duration) {
-    // gpio_write(BUZZER_PIN, 1);
+    gpio_write(BUZZER_PIN, 1);
     delay(duration);
-    // gpio_write(BUZZER_PIN, 0);
+    gpio_write(BUZZER_PIN, 0);
 }
 
 void beepSuccess() {
@@ -326,9 +326,9 @@ void beepSuccess() {
 }
 
 void beepError() {
-    beep(BEEP_ERROR_MS);
-    delay(BEEP_ERROR_PAUSE_MS);
-    beep(BEEP_ERROR_MS);
+    // beep(BEEP_ERROR_MS);
+    // delay(BEEP_ERROR_PAUSE_MS);
+    // beep(BEEP_ERROR_MS);
 }
 
 void beepDouble() {
