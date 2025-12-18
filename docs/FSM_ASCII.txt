@@ -1,0 +1,84 @@
+TapTrack FSM (ASCII diagram)
+
+Legend:
+  -->  transition
+  [STATE]  state box
+  *note*  clarifying behavior
+
+             +-------------------+
+             |  STATE_INITIALIZE |
+             |  (boot, init HW)  |
+             +---------+---------+
+                       |
+                       | init complete
+                       v
+             +-------------------+
+             |     STATE_IDLE    |<-----------------------------------+
+             | (background loop) |                                    |
+             +---+---+---+---+---+                                    |
+                 |   |   |   ^                                        |
+                 |   |   |   | queue/sync scheduled when queue non-empty
+                 |   |   |   |                                        |
+  card IRQ ---> *|   |   |   |                                        |
+  (ISR sets flag) |   |   |   |                                        |
+                 v   |   |   |                                        |
+           +-----------+ |   | |                                        |
+           |  card     | |   | |                                        |
+           | detection | |   | |                                        |
+           | stabilization|  | | |                                        |
+           +-----+-----+ |   | |                                        |
+                 |       |   | |                                        |
+                 v       |   | |                                        |
+           +-----------------------+                                   |
+           |   STATE_PROCESS_CARD  |                                   |
+           | - read UID (blocking read function returns string)       |
+           | - validate RTC, duplicate checks                        |
+           | - lookup userDB                                           |
+           | *immediate beep here* (non-blocking)                     |
+           +---+---+---+---+---+---+                                   |
+               |   |           |                                       |
+               |   |           | registered & online                   |
+               |   | unreg.   v                                       |
+               |   |      +------------------+                         |
+               |   |      |   STATE_IDLE     |<--- fetchUser / sendPending
+               |   |      | (unregistered flow)|                       |
+               |   |      +------------------+                         |
+               |   |                                                   |
+ registered -> |   +--------------------------------->+                |
+ & online      v                                syncId accepted?      |
+           +-------------------+                   |                 |
+           |  STATE_UPLOAD_DATA|<-- sendToFirebase --+                 |
+           | (non-blocking send)|                                     |
+           +---+---------------+                                     |
+               |                                                      |
+               | (syncId returned)                                    |
+               | uploadTracker started (async confirm)                |
+               v                                                      |
+           +-------------------+                                       |
+           |     STATE_IDLE    |---------------------------------------+
+           +-------------------+
+
+If upload fails immediately or retries exhausted:
+  -> STATE_QUEUE_DATA (enqueue record locally)
+
+STATE_QUEUE_DATA:
+  - enqueue record into AttendanceQueue
+  - indicate offline success
+  - transition to STATE_IDLE
+
+STATE_SYNC_QUEUE:
+  - triggered from STATE_IDLE when queue non-empty and conditions met
+  - attempts sendToFirebase on queue record; on success associate syncId
+  - uses uploadTracker to await confirmation; on fail move record to back
+
+Upload confirmation path (async):
+  - uploadTracker.active is polled in STATE_IDLE
+  - if isSyncConfirmed(syncId): remove queue entry if present, indicate success
+  - timeouts cause uploadTracker.clear() and may push to queue
+
+Notes:
+  - Card detection is interrupt-driven (ISR sets `cardDetected` volatile flag).
+  - `handleIdle()` reads `cardDetected` atomically with `noInterrupts()`.
+  - Buzzer and LED are serviced by `updateIndicator()` and use non-blocking sequencing.
+  - Firebase init/retry are non-blocking: `serviceFirebaseTasks()` runs in `loop()`.
+  - State timeouts force a cleanup and return to IDLE to avoid blocking.

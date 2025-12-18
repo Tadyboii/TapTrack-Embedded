@@ -36,6 +36,68 @@ static void buzzerOff() {
     gpio_write(BUZZER_PIN, 0);
 }
 
+// Buzzer sequencing (non-blocking)
+static const uint16_t* buzzerSeqPtr = nullptr;
+static int buzzerSeqLen = 0;
+static int buzzerSeqIndex = 0;
+static bool buzzerSeqActive = false;
+
+static bool buzzerSingleActive = false;
+static unsigned long buzzerSingleStart = 0;
+static unsigned long buzzerSingleDuration = 0;
+
+static void startBuzzerSingle(uint16_t duration) {
+    // start simple single-duration beep
+    gpio_write(BUZZER_PIN, 1);
+    buzzerSingleStart = millis();
+    buzzerSingleDuration = duration;
+    buzzerSingleActive = true;
+    // stop any sequence
+    buzzerSeqActive = false;
+}
+
+static void startBuzzerSequence(const uint16_t* seq, int len) {
+    if (!seq || len <= 0) return;
+    buzzerSeqPtr = seq;
+    buzzerSeqLen = len;
+    buzzerSeqIndex = 0;
+    buzzerSeqActive = true;
+    buzzerSingleActive = false;
+
+    // start with first element (on)
+    gpio_write(BUZZER_PIN, 1);
+    unsigned long now = millis();
+    // next change after seq[0]
+    // store next change time in buzzerSingleStart for simplicity
+    buzzerSingleStart = now + (unsigned long)seq[0];
+    buzzerSeqIndex = 1; // next index to process
+}
+
+static void serviceBuzzerIndicator() {
+    unsigned long now = millis();
+    if (buzzerSeqActive) {
+        if (now >= buzzerSingleStart) {
+            if (buzzerSeqIndex >= buzzerSeqLen) {
+                // sequence finished
+                gpio_write(BUZZER_PIN, 0);
+                buzzerSeqActive = false;
+            } else {
+                // toggle based on index: odd index = off, even = on (we started with on)
+                bool on = (buzzerSeqIndex % 2 == 0) ? true : false;
+                gpio_write(BUZZER_PIN, on ? 1 : 0);
+                // schedule next change
+                buzzerSingleStart = now + (unsigned long)buzzerSeqPtr[buzzerSeqIndex];
+                buzzerSeqIndex++;
+            }
+        }
+    } else if (buzzerSingleActive) {
+        if (now - buzzerSingleStart >= buzzerSingleDuration) {
+            gpio_write(BUZZER_PIN, 0);
+            buzzerSingleActive = false;
+        }
+    }
+}
+
 // =============================================================================
 // PUBLIC FUNCTIONS
 // =============================================================================
@@ -216,6 +278,9 @@ void updateIndicator() {
                 break;
         }
     }
+
+    // service non-blocking buzzer here so callers don't need to
+    serviceBuzzerIndicator();
 }
 
 void clearIndicators() {
@@ -316,29 +381,26 @@ void indicateMode(SystemMode mode) {
 // =============================================================================
 
 void beep(uint16_t duration) {
-    gpio_write(BUZZER_PIN, 1);
-    delay(duration);
-    gpio_write(BUZZER_PIN, 0);
+    startBuzzerSingle(duration);
 }
 
 void beepSuccess() {
-    beep(BEEP_SUCCESS_MS);
+    startBuzzerSingle(BEEP_SUCCESS_MS);
 }
 
 void beepError() {
-    // beep(BEEP_ERROR_MS);
-    // delay(BEEP_ERROR_PAUSE_MS);
-    // beep(BEEP_ERROR_MS);
+    // two short error beeps
+    static const uint16_t seq[] = {BEEP_ERROR_MS, BEEP_ERROR_PAUSE_MS, BEEP_ERROR_MS};
+    startBuzzerSequence(seq, sizeof(seq)/sizeof(seq[0]));
 }
 
 void beepDouble() {
-    beep(BEEP_SUCCESS_MS);
-    delay(BEEP_ERROR_PAUSE_MS);
-    beep(BEEP_SUCCESS_MS);
+    static const uint16_t seq[] = {BEEP_SUCCESS_MS, BEEP_ERROR_PAUSE_MS, BEEP_SUCCESS_MS};
+    startBuzzerSequence(seq, sizeof(seq)/sizeof(seq[0]));
 }
 
 void beepLong() {
-    beep(500);
+    startBuzzerSingle(500);
 }
 
 // =============================================================================

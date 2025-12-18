@@ -278,12 +278,16 @@ void processData(AsyncResult &aResult) {
                             }
                             
                             if (name.length() > 0) {
-                                userDB.registerUser(uid, name);
-                                Serial.printf("📥 Stream: user %s (%s)\n", 
-                                             name.c_str(), uid.c_str());
-                                
-                                if (userChangeCallback) {
-                                    userChangeCallback(uid, name, true);
+                                UserInfo existing = userDB.getUserInfo(uid);
+                                if (!existing.isRegistered || existing.name != name) {
+                                    userDB.registerUser(uid, name);
+                                    userDB.saveToSPIFFS();
+
+                                    Serial.printf("📥 Stream: user %s (%s)\n", name.c_str(), uid.c_str());
+
+                                    if (userChangeCallback) {
+                                        userChangeCallback(uid, name, true);
+                                    }
                                 }
                             }
                         }
