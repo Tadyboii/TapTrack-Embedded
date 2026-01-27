@@ -1,19 +1,166 @@
-# TapTrack Embedded Attendance System
+# TapTrack-Embedded
 
-An ESP32-based RFID attendance tracking system with hybrid online/offline capabilities, designed for reliability and efficiency using interrupt-driven architecture and Finite State Machine (FSM) principles.
+This repository contains TapTrack — an ESP32-based RFID attendance system implemented using a minimal-intrusion Finite State Machine (FSM) design. The firmware is written for the Arduino framework (PlatformIO) and focuses on responsiveness (non-blocking operations), interrupt-driven card detection, and a centralized, non-blocking indicator (LED + buzzer) subsystem.
 
-## Table of Contents
-- [Key Features](#key-features)
-- [Architecture Overview](#architecture-overview)
-- [System Components](#system-components)
-- [Hardware Setup](#hardware-setup)
-- [Software Architecture](#software-architecture)
-- [Configuration](#configuration)
-- [Build and Upload](#build-and-upload)
-- [Usage](#usage)
-- [Data Flow](#data-flow)
+
+---
+
+**Contents**
+- `src/main.cpp`: Main FSM, state handlers, connectivity and upload logic.
+- `src/indicator.cpp`: LED and buzzer control (non-blocking buzzer sequencer).
+- `src/RFID.cpp`: MFRC522 RFID handling and ISR for card detection.
+- `src/Firebase.cpp`: Firebase client integration (non-blocking send/loop usage).
+- `include/*.h`: Configuration, hardware pin mapping, and helper headers.
+
+---
+
+**Overview — Finite State Machine (FSM)**
+
+The application runs as a small FSM with the following states:
+- **STATE_INITIALIZE**: Boot, peripheral init, non-blocking Firebase init kick-off.
+- **STATE_IDLE**: Low-activity state. Services background tasks, checks interrupts for card detection, and triggers queue sync.
+- **STATE_PROCESS_CARD**: Reads UID from the RFID reader, validates RTC, checks duplicates, looks up user, provides immediate feedback (beep), and decides next state.
+- **STATE_UPLOAD_DATA**: Non-blocking upload attempt to Firebase; returns to `STATE_IDLE` immediately while waiting for asynchronous confirmation.
+- **STATE_QUEUE_DATA**: Enqueue attendance locally when offline or upload fails.
+- **STATE_SYNC_QUEUE**: Dedicated queue-sync state used to publish queued attendance records when online and no upload is active.
+
+The FSM is implemented in `src/main.cpp` using `transitionTo()` and dedicated `handle*()` functions for each state.
+
+---
+
+**Diagrams**
+
+- ASCII FSM diagram: `docs/FSM_ASCII.txt`
+- SVG flowchart: `docs/fsm_diagram.svg`
+ 
+ <p align="center">
+   <img src="docs/fsm_diagram.svg" alt="FSM Diagram" width="780" />
+ </p>
+
+---
+
+## Interrupt-driven card detection (bare-metal pattern)
+An ESP32-based RFID attendance system implemented with a clear Finite State Machine (FSM), interrupt-driven card detection, and non-blocking scheduling for responsiveness. The codebase targets PlatformIO / Arduino and is optimized to provide immediate user feedback while remaining resilient to network failures.
+- The FSM polls this flag inside `handleIdle()` using `noInterrupts()/interrupts()` to read it atomically.
+- A short stabilization / debounce window (20 ms) is implemented using `millis()` so the FSM transitions to `STATE_PROCESS_CARD` only when the card is confirmed present — this avoids blocking the loop.
+- [Quick Start](#quick-start)
+- [Runtime sequencing (compact)](#runtime-sequencing-compact)
+- [FSM Overview](#fsm-overview)
+- [Non-blocking & scheduling](#non-blocking--scheduling)
+- [Diagrams](#diagrams)
+- [Components](#components)
+- [Function reference](#function-reference-top-level-functions-in-srcmaincpp)
+- [Build & Test](#build--test)
+- [Notes & next steps](#notes--next-steps)
 - [Troubleshooting](#troubleshooting)
-- [FAQ](#faq)
+- [Contributing](#contributing)
+- **Scheduled restart (non-blocking long-press)**: A long-press clears WiFi and schedules a restart (`restartPending` + `restartAt`) while playing a long beep, allowing the loop to continue servicing other tasks until the restart time is reached.
+- **Main loop orchestration**: `loop()` remains the single cooperative scheduler: it calls `checkStateTimeout()`, `processSerialCommand()`, `updateIndicator()`, `serviceFirebaseTasks()`, handles scheduled restart, then runs the current state's handler. This keeps the system responsive and deterministic.
+Build and upload with PlatformIO:
+
+```bash
+platformio run
+platformio run --target upload
+platformio device monitor --baud 115200
+```
+
+Make sure `secrets.h` contains your WiFi and Firebase credentials (not committed).
+---
+
+This summarizes the runtime order of events for a normal registered tap (compact timeline):
+
+1. ISR: `readCardISR()` fires on RFID IRQ → sets `cardDetected = true`.
+2. `handleIdle()` atomically reads `cardDetected` and uses a 20 ms stabilization window to debounce.
+3. Transition to `STATE_PROCESS_CARD`.
+4. `handleProcessCard()` calls `readCardUID()` → valid UID.
+5. Populate `stateContext`, call `userDB.recordTap(uid)` (if registered).
+6. `indicateSuccessOnline()` schedules the buzzer/LED sequence (non-blocking).
+7. `transitionTo(STATE_UPLOAD_DATA)`.
+8. `handleUploadData()` calls `sendToFirebase(...)`; on success it returns a `syncId` and `uploadTracker.start(syncId, uid)` is called.
+9. `transitionTo(STATE_IDLE)` immediately — upload continues asynchronously.
+10. `handleIdle()` polls `uploadTracker.active` until `isSyncConfirmed(syncId)`; on confirmation the queue entry is removed and success indicated.
+
+This sequencing ensures immediate local feedback and non-blocking network operations.
+
+- **`checkFirebaseConnection()`**: Throttles periodic attempts to (re)initialize Firebase — sets retry/init flags rather than blocking.
+The FSM in `src/main.cpp` is composed of these states:
+- `STATE_INITIALIZE` — boot, peripheral init, kick off non-blocking Firebase init.
+- `STATE_IDLE` — background tasks, poll ISR flag, start queue sync when appropriate.
+- `STATE_PROCESS_CARD` — read UID, validate, user lookup, immediate feedback, decide next state.
+- `STATE_UPLOAD_DATA` — start non-blocking upload and return to IDLE.
+- `STATE_QUEUE_DATA` — enqueue attendance when offline or upload fails.
+- `STATE_SYNC_QUEUE` — dedicated state for sending queued records.
+
+Transitions are handled by `transitionTo()` and each state has a `handle*()` function.
+  - Reads UID via `readCardUID()`.
+  - If the read fails: logs `LOG_ERROR("[CARD] Failed to read UID\n")`, clears IRQ and returns to `STATE_IDLE`.
+The system provides immediate UX feedback while network and I/O run concurrently and without blocking the FSM.
+
+- **`handleSyncQueue()`**: Attempts to publish a queued record to Firebase. If successful it sets the queue entry's `syncId` and starts `uploadTracker`; otherwise it bumps retry counters and moves the record to the back to retry later.
+ASCII FSM diagram: `docs/FSM_ASCII.txt`
+SVG flowchart: `docs/fsm_diagram.svg`
+
+<p align="center">
+  <img src="docs/fsm_diagram.svg" alt="FSM Diagram" width="780" />
+</p>
+## Build & Test
+
+Detailed hardware and software component descriptions are below (unchanged from the previous section). Key files:
+- `src/main.cpp`, `src/indicator.cpp`, `src/RFID.cpp`, `src/Firebase.cpp`, `include/*.h`.
+
+See the full component and hardware sections further down for pinouts and integration notes.
+
+Upload to a connected ESP32:
+<details>
+<summary>Click to expand function reference</summary>
+
+- `transitionTo(SystemState newState)` — central state transition helper.
+- `checkStateTimeout()` — watchdog to detect and recover from hung states.
+- `checkModeButton()` / `toggleMode()` — mode button handling with non-blocking restart scheduling.
+- `isRTCValid(const DateTime& time)` — validate RTC values.
+- `getAttendanceStatus()` / `formatTimestamp()` — timestamp helpers.
+- `isDuplicateTap(String uid)` — duplicate tap prevention.
+- `checkAndReconnectWiFi()` — WiFi logic per mode.
+- `checkFirebaseConnection()` / `serviceFirebaseTasks()` — Firebase non-blocking init/retry.
+- `onUserChange(...)` — user-stream callback.
+- `handleInitialize()`, `handleIdle()`, `handleProcessCard()`, `handleUploadData()`, `handleQueueData()`, `handleSyncQueue()` — state handlers.
+- `processSerialCommand()` — serial console commands.
+
+</details>
+  - Tune beep durations in `include/config.h`.
+  - Convert any intentionally blocking test/startup delays to non-blocking timers.
+Build and upload with PlatformIO (zsh):
+
+```bash
+platformio run
+platformio run --target upload
+platformio device monitor --baud 115200
+```
+
+---
+
+## Notes & next steps
+
+- The project minimizes RTOS usage and follows a baremetal-friendly, interrupt-driven design.
+- Intentional blocking calls used in `startupSequence()` / test helpers are left as-is; I can convert them to non-blocking timers on request.
+- Possible next tasks:
+  - Tune beep durations in `include/config.h`.
+  - Convert startup/test blocking delays to non-blocking timers.
+  - Add an example serial transcript for a successful tap.
+
+---
+
+## Troubleshooting
+
+- If the device does not boot: open serial monitor and check for early errors.
+- If RFID misses taps: verify IRQ wiring and confirm `docs/FSM_ASCII.txt` for timing; ensure `RFID_IRQ_PIN` matches hardware.
+- If Firebase fails to connect: confirm credentials in `secrets.h` and check WiFi status via serial commands.
+
+---
+
+## Contributing
+
+PRs welcome: keep changes minimal and focused. Use PlatformIO to build and test locally.
 - [Contributing](#contributing)
 
 ## Key Features
